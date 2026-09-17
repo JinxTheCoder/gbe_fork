@@ -785,51 +785,72 @@ static uint16 parse_listen_port(class Local_Storage *local_storage)
 // user::general::account_name
 static std::string parse_account_name(class Local_Storage *local_storage)
 {
-    const std::string random_names_path =
-        Local_Storage::get_game_settings_path() + "random_names.txt";
+    auto random_name_setting =
+        ini.GetValue("user::general", "random_account_name", "0");
 
-    std::ifstream random_names_file(std::filesystem::u8path(random_names_path));
-    if (random_names_file.is_open()) {
-        common_helpers::consume_bom(random_names_file);
+    const bool use_random_name =
+        random_name_setting &&
+        random_name_setting[0] == '1' &&
+        random_name_setting[1] == '\0';
 
-        std::vector<std::string> names{};
-        std::string line{};
+    if (use_random_name) {
+        const std::string random_names_path =
+            Local_Storage::get_game_settings_path() + "random_names.txt";
 
-        while (std::getline(random_names_file, line)) {
-            line = common_helpers::string_strip(line);
+        std::ifstream random_names_file(std::filesystem::u8path(random_names_path));
 
-            if (line.empty() || line[0] == '#') {
-                continue;
+        if (random_names_file.is_open()) {
+            common_helpers::consume_bom(random_names_file);
+
+            std::vector<std::string> names{};
+            std::string line{};
+
+            while (std::getline(random_names_file, line)) {
+                line = common_helpers::string_strip(line);
+
+                if (line.empty() || line[0] == '#') {
+                    continue;
+                }
+
+                names.push_back(line);
             }
 
-            names.push_back(line);
-        }
+            if (!names.empty()) {
+                std::random_device rd;
+                std::mt19937 generator(rd());
+                std::uniform_int_distribution<size_t> distribution(
+                    0,
+                    names.size() - 1
+                );
 
-        if (!names.empty()) {
-            std::random_device rd;
-            std::mt19937 generator(rd());
-            std::uniform_int_distribution<size_t> distribution(0, names.size() - 1);
+                const std::string selected_name =
+                    names[distribution(generator)];
 
-            const std::string selected_name = names[distribution(generator)];
+                PRINT_DEBUG(
+                    "random_names.txt selected account name '%s'",
+                    selected_name.c_str()
+                );
+
+                return selected_name;
+            }
 
             PRINT_DEBUG(
-                "random_names.txt selected account name '%s'",
-                selected_name.c_str()
+                "random_names.txt exists but contains no usable account names"
             );
-
-            return selected_name;
         }
-
-        PRINT_DEBUG("random_names.txt exists but contains no usable account names");
     }
 
     auto name = ini.GetValue("user::general", "account_name");
+
     if (!name || !name[0]) {
         name = DEFAULT_NAME;
+
         save_global_ini_value(
             local_storage,
             config_ini_user,
-            "user::general", "account_name", IniValue(name),
+            "user::general",
+            "account_name",
+            IniValue(name),
             "user account name"
         );
     }
