@@ -24,6 +24,7 @@
 #include "dll/settings_parser_ufs.h"
 #include "dll/base64.h"
 
+#include <random>
 
 constexpr const static char config_ini_app[]     = "configs.app.ini";
 constexpr const static char config_ini_main[]    = "configs.main.ini";
@@ -784,9 +785,57 @@ static uint16 parse_listen_port(class Local_Storage *local_storage)
 // user::general::account_name
 static std::string parse_account_name(class Local_Storage *local_storage)
 {
+    const std::string random_names_path =
+        Local_Storage::get_game_settings_path() + "random_names.txt";
+
+    std::ifstream random_names_file(std::filesystem::u8path(random_names_path));
+
+    if (random_names_file.is_open()) {
+        common_helpers::consume_bom(random_names_file);
+
+        std::vector<std::string> names{};
+        std::string line{};
+
+        while (std::getline(random_names_file, line)) {
+            line = common_helpers::string_strip(line);
+
+            if (line.empty() || line[0] == '#') {
+                continue;
+            }
+
+            names.push_back(line);
+        }
+
+        if (!names.empty()) {
+            std::random_device rd;
+            std::mt19937 generator(rd());
+
+            std::uniform_int_distribution<size_t> distribution(
+                0,
+                names.size() - 1
+            );
+
+            const std::string selected_name =
+                names[distribution(generator)];
+
+            PRINT_DEBUG(
+                "random_names.txt selected account name '%s'",
+                selected_name.c_str()
+            );
+
+            return selected_name;
+        }
+
+        PRINT_DEBUG(
+            "random_names.txt exists but contains no usable account names"
+        );
+    }
+
     auto name = ini.GetValue("user::general", "account_name");
+
     if (!name || !name[0]) {
         name = DEFAULT_NAME;
+
         save_global_ini_value(
             local_storage,
             config_ini_user,
@@ -794,6 +843,7 @@ static std::string parse_account_name(class Local_Storage *local_storage)
             "user account name"
         );
     }
+
     return std::string(name);
 }
 
