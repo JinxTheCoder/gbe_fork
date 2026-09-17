@@ -86,15 +86,18 @@ jobs:
           path: "${{ env.DEPS_CACHE_DIR }}/${{ env.PREMAKE_ACTION }}"
 
       # extra helpers/tools, these are not built inside the deps build dir
+      # extra helpers/tools, these are not built inside the deps build dir
       - name: "Clone third-party build helpers (common/win)"
         uses: actions/checkout@v6
         with:
+          repository: Detanup01/gbe_fork
           ref: "third-party/common/win"
           path: "${{env.THIRD_PARTY_BASE_DIR}}/common/win"
 
       - name: "Clone third-party deps (build/win)"
         uses: actions/checkout@v6
         with:
+          repository: Detanup01/gbe_fork
           ref: "third-party/build/win"
           path: "${{env.THIRD_PARTY_BASE_DIR}}/build/win"
 
