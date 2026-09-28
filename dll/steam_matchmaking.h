@@ -32,6 +32,8 @@ struct Pending_Joins {
     // steam_settings/workshop_cache/<PublishedFileId>.
     PublishedFileId_t required_workshop_id{};
     bool waiting_for_workshop{};
+    bool waiting_for_workshop_consent{};
+    bool workshop_consent_denied{};
 };
 
 struct Pending_Creates {
@@ -112,6 +114,7 @@ public ISteamMatchmaking
     void meccha_queue_workshop_request(PublishedFileId_t id, const char *reason);
     bool meccha_is_workshop_installed(PublishedFileId_t id) const;
     PublishedFileId_t meccha_get_lobby_required_workshop(const Lobby *lobby);
+    void meccha_request_workshop_consent(Pending_Joins &pending_join, PublishedFileId_t id, const char *reason);
 
     google::protobuf::Map<std::string,std::string>::const_iterator caseinsensitive_find(const ::google::protobuf::Map< ::std::string, ::std::string >& map, std::string key);
 
