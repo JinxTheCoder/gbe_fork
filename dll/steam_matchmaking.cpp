@@ -17,6 +17,7 @@
 
 #include "dll/steam_matchmaking.h"
 
+#include <algorithm>
 #include <atomic>
 #include <filesystem>
 #include <fstream>
@@ -31,6 +32,7 @@
 #ifdef _MSC_VER
 #pragma comment(lib, "User32.lib")
 #pragma comment(lib, "Gdi32.lib")
+#pragma comment(lib, "Advapi32.lib")
 #pragma comment(lib, "Urlmon.lib")
 #endif
 #endif
@@ -503,6 +505,144 @@ static bool meccha_run_hidden_process(const std::string &command_line, const std
     return true;
 }
 
+
+static bool meccha_run_visible_process(const std::string &command_line, const std::filesystem::path &working_dir, DWORD &exit_code)
+{
+    std::string mutable_command = command_line;
+
+    STARTUPINFOA startup{};
+    startup.cb = sizeof(startup);
+
+    PROCESS_INFORMATION process{};
+    const std::string working = working_dir.string();
+
+    const BOOL created = CreateProcessA(
+        nullptr,
+        mutable_command.data(),
+        nullptr,
+        nullptr,
+        FALSE,
+        CREATE_NEW_CONSOLE,
+        nullptr,
+        working.empty() ? nullptr : working.c_str(),
+        &startup,
+        &process
+    );
+
+    if (!created) {
+        exit_code = GetLastError();
+        return false;
+    }
+
+    WaitForSingleObject(process.hProcess, INFINITE);
+    if (!GetExitCodeProcess(process.hProcess, &exit_code)) {
+        exit_code = GetLastError();
+        CloseHandle(process.hThread);
+        CloseHandle(process.hProcess);
+        return false;
+    }
+
+    CloseHandle(process.hThread);
+    CloseHandle(process.hProcess);
+    return true;
+}
+
+static std::string meccha_detect_steam_account_name()
+{
+    char value[256]{};
+    DWORD value_size = sizeof(value);
+
+    const LSTATUS status = RegGetValueA(
+        HKEY_CURRENT_USER,
+        "Software\\Valve\\Steam",
+        "AutoLoginUser",
+        RRF_RT_REG_SZ,
+        nullptr,
+        value,
+        &value_size
+    );
+
+    if (status != ERROR_SUCCESS || !value[0]) return {};
+
+    std::string username(value);
+    username.erase(
+        std::remove_if(username.begin(), username.end(), [](unsigned char c) {
+            return c == '\r' || c == '\n' || c == '"';
+        }),
+        username.end()
+    );
+
+    if (username.size() > 128) username.resize(128);
+    return username;
+}
+
+static bool meccha_try_authenticated_steamcmd_download(
+    const std::filesystem::path &steamcmd_exe,
+    const std::filesystem::path &tool_dir,
+    AppId_t appid,
+    PublishedFileId_t id,
+    std::string &error
+)
+{
+    const std::string username = meccha_detect_steam_account_name();
+    if (username.empty()) {
+        error =
+            "SteamCMD needs an authenticated Steam account for this item, but no signed-in Steam account "
+            "was detected. Start Steam, sign in to an account that has access to MECCHA CHAMELEON, then retry.";
+        return false;
+    }
+
+    const std::string id_text = std::to_string(static_cast<unsigned long long>(id));
+    const std::string prompt =
+        "Steam Workshop item " + id_text + " requires an authenticated Steam account.\n\n"
+        "Detected Steam account: " + username + "\n\n"
+        "Open Valve SteamCMD sign-in now?\n\n"
+        "Your password and Steam Guard code are entered directly into SteamCMD. "
+        "MECCHA/Goldberg does not read or store them.";
+
+    const int response = MessageBoxA(
+        nullptr,
+        prompt.c_str(),
+        "MECCHA Workshop - Steam Sign In Required",
+        MB_YESNO | MB_ICONQUESTION | MB_SETFOREGROUND | MB_TOPMOST
+    );
+
+    if (response != IDYES) {
+        error = "Authenticated SteamCMD download was cancelled.";
+        return false;
+    }
+
+    const std::string command =
+        "\"" + steamcmd_exe.string() + "\" +login \"" + username + "\" +workshop_download_item " +
+        std::to_string(appid) + " " + id_text + " validate +quit";
+
+    DWORD exit_code{};
+    PRINT_DEBUG(
+        "MECCHA workshop: starting authenticated SteamCMD download for item %llu using detected account '%s'",
+        id,
+        username.c_str()
+    );
+
+    if (!meccha_run_visible_process(command, tool_dir, exit_code)) {
+        error = "Authenticated SteamCMD could not be started.";
+        return false;
+    }
+
+    PRINT_DEBUG("MECCHA workshop: authenticated SteamCMD exit code %lu for item %llu", exit_code, id);
+
+    const auto source = tool_dir / "steamapps" / "workshop" / "content" /
+        std::to_string(appid) / id_text;
+
+    if (!meccha_directory_has_files(source)) {
+        error =
+            "SteamCMD sign-in finished, but the Workshop item was still not downloaded. "
+            "The Steam account may not have access to MECCHA CHAMELEON or this Workshop item.";
+        return false;
+    }
+
+    return true;
+}
+
 static bool meccha_bootstrap_steamcmd(const std::filesystem::path &tool_dir, std::string &error)
 {
     std::error_code ec;
@@ -652,10 +792,33 @@ static void meccha_start_workshop_download(PublishedFileId_t id, AppId_t appid)
         PRINT_DEBUG("MECCHA workshop: SteamCMD exit code %lu for item %llu", exit_code, id);
 
         if (!meccha_copy_workshop_to_cache(appid, id, tool_dir, error)) {
-            meccha_set_download_status(id, MecchaWorkshopDownloadStatus::failed, error);
-            meccha_push_download_notice("Workshop " + id_text + " failed: " + error);
-            PRINT_DEBUG("MECCHA workshop: item %llu failed: %s", id, error.c_str());
-            return;
+            PRINT_DEBUG(
+                "MECCHA workshop: anonymous download did not produce item %llu, trying authenticated SteamCMD",
+                id
+            );
+
+            std::string auth_error;
+            if (!meccha_try_authenticated_steamcmd_download(
+                    steamcmd_exe,
+                    tool_dir,
+                    appid,
+                    id,
+                    auth_error
+                )) {
+                error = auth_error;
+                meccha_set_download_status(id, MecchaWorkshopDownloadStatus::failed, error);
+                meccha_push_download_notice("Workshop " + id_text + " failed: " + error);
+                PRINT_DEBUG("MECCHA workshop: item %llu failed after authenticated fallback: %s", id, error.c_str());
+                return;
+            }
+
+            error.clear();
+            if (!meccha_copy_workshop_to_cache(appid, id, tool_dir, error)) {
+                meccha_set_download_status(id, MecchaWorkshopDownloadStatus::failed, error);
+                meccha_push_download_notice("Workshop " + id_text + " failed: " + error);
+                PRINT_DEBUG("MECCHA workshop: item %llu could not be activated after authenticated download: %s", id, error.c_str());
+                return;
+            }
         }
 
         std::error_code ec;
