@@ -20,6 +20,7 @@
 #include <atomic>
 #include <filesystem>
 #include <fstream>
+#include <map>
 #include <mutex>
 #include <thread>
 
@@ -352,6 +353,93 @@ static bool meccha_take_download_consent_result(MecchaWorkshopConsentResult &out
 
 #endif
 
+
+struct MecchaPendingWorkshopState {
+    PublishedFileId_t workshop_id{};
+    bool waiting_for_consent{};
+    bool waiting_for_download{};
+    bool denied{};
+};
+
+static std::map<uint64, MecchaPendingWorkshopState> meccha_pending_workshop;
+static std::string meccha_required_workshop_id;
+
+#ifdef _WIN32
+static bool meccha_f8_was_down{};
+#endif
+
+static bool meccha_is_workshop_installed(PublishedFileId_t id)
+{
+    if (!id || id == k_PublishedFileIdInvalid) return false;
+
+    std::error_code ec;
+    const auto path = meccha_settings_path() /
+        MECCHA_WORKSHOP_CACHE_DIR /
+        std::to_string(static_cast<unsigned long long>(id));
+
+    return std::filesystem::is_directory(path, ec) && !ec;
+}
+
+static PublishedFileId_t meccha_get_lobby_required_workshop(const Lobby *lobby)
+{
+    if (!lobby) return k_PublishedFileIdInvalid;
+
+    const auto it = lobby->values().find(MECCHA_WORKSHOP_LOBBY_KEY);
+    if (it == lobby->values().end()) return k_PublishedFileIdInvalid;
+
+    PublishedFileId_t id{};
+    if (!meccha_parse_workshop_id(it->second, id)) return k_PublishedFileIdInvalid;
+    return id;
+}
+
+static void meccha_queue_workshop_request(PublishedFileId_t id, const char *reason, AppId_t appid)
+{
+    if (!id || id == k_PublishedFileIdInvalid || meccha_is_workshop_installed(id)) return;
+
+    const auto request_dir = meccha_settings_path() / MECCHA_WORKSHOP_REQUEST_DIR;
+    std::error_code ec;
+    std::filesystem::create_directories(request_dir, ec);
+    if (ec) {
+        PRINT_DEBUG("MECCHA workshop request: failed to create request directory for %llu", id);
+        return;
+    }
+
+    const auto request_file = request_dir /
+        (std::to_string(static_cast<unsigned long long>(id)) + ".request");
+
+    std::ofstream out(request_file, std::ios::binary | std::ios::trunc);
+    if (!out) {
+        PRINT_DEBUG("MECCHA workshop request: failed to queue %llu", id);
+        return;
+    }
+
+    out << "workshop_id=" << static_cast<unsigned long long>(id) << "\n";
+    out << "reason=" << (reason ? reason : "unknown") << "\n";
+    out << "appid=" << appid << "\n";
+
+    PRINT_DEBUG("MECCHA workshop request queued item %llu reason='%s'", id, reason ? reason : "unknown");
+}
+
+static void meccha_begin_workshop_consent(uint64 lobby_id, PublishedFileId_t id, const char *reason, AppId_t appid)
+{
+    if (!lobby_id || !id || id == k_PublishedFileIdInvalid || meccha_is_workshop_installed(id)) return;
+
+    auto &state = meccha_pending_workshop[lobby_id];
+    state.workshop_id = id;
+    state.waiting_for_download = false;
+    state.denied = false;
+
+#ifdef _WIN32
+    state.waiting_for_consent = true;
+    meccha_start_download_consent_dialog(lobby_id, id);
+    PRINT_DEBUG("MECCHA workshop: asking permission for item %llu reason='%s'", id, reason ? reason : "unknown");
+#else
+    state.waiting_for_consent = false;
+    state.waiting_for_download = true;
+    meccha_queue_workshop_request(id, reason, appid);
+#endif
+}
+
 } // namespace
 
 
@@ -378,145 +466,6 @@ Lobby* Steam_Matchmaking::get_lobby(CSteamID id)
         return NULL;
 
     return &(*lobby);
-}
-
-bool Steam_Matchmaking::meccha_is_workshop_installed(PublishedFileId_t id) const
-{
-    if (!id || id == k_PublishedFileIdInvalid) return false;
-
-    std::error_code ec;
-    const auto path = meccha_settings_path() /
-        MECCHA_WORKSHOP_CACHE_DIR /
-        std::to_string(static_cast<unsigned long long>(id));
-
-    return std::filesystem::is_directory(path, ec) && !ec;
-}
-
-PublishedFileId_t Steam_Matchmaking::meccha_get_lobby_required_workshop(const Lobby *lobby)
-{
-    if (!lobby) return k_PublishedFileIdInvalid;
-
-    const auto value = caseinsensitive_find(lobby->values(), MECCHA_WORKSHOP_LOBBY_KEY);
-    if (value == lobby->values().end()) return k_PublishedFileIdInvalid;
-
-    PublishedFileId_t id{};
-    if (!meccha_parse_workshop_id(value->second, id)) return k_PublishedFileIdInvalid;
-    return id;
-}
-
-void Steam_Matchmaking::meccha_request_workshop_consent(Pending_Joins &pending_join, PublishedFileId_t id, const char *reason)
-{
-    if (!id || id == k_PublishedFileIdInvalid || meccha_is_workshop_installed(id)) return;
-
-    pending_join.required_workshop_id = id;
-    pending_join.waiting_for_workshop = false;
-    pending_join.waiting_for_workshop_consent = true;
-    pending_join.workshop_consent_denied = false;
-
-#ifdef _WIN32
-    meccha_start_download_consent_dialog(
-        pending_join.lobby_id.ConvertToUint64(),
-        id
-    );
-    PRINT_DEBUG("MECCHA workshop: asking permission for item %llu reason='%s'", id, reason ? reason : "unknown");
-#else
-    // Non-Windows builds do not have the MECCHA dialog UI yet. Preserve the
-    // previous behavior there and queue the request immediately.
-    pending_join.waiting_for_workshop_consent = false;
-    pending_join.waiting_for_workshop = true;
-    meccha_queue_workshop_request(id, reason);
-#endif
-}
-
-void Steam_Matchmaking::meccha_queue_workshop_request(PublishedFileId_t id, const char *reason)
-{
-    if (!id || id == k_PublishedFileIdInvalid || meccha_is_workshop_installed(id)) return;
-
-    const auto request_dir = meccha_settings_path() / MECCHA_WORKSHOP_REQUEST_DIR;
-    std::error_code ec;
-    std::filesystem::create_directories(request_dir, ec);
-    if (ec) {
-        PRINT_DEBUG("MECCHA workshop request: failed to create request directory for %llu", id);
-        return;
-    }
-
-    const auto request_file = request_dir /
-        (std::to_string(static_cast<unsigned long long>(id)) + ".request");
-
-    std::ofstream out(request_file, std::ios::binary | std::ios::trunc);
-    if (!out) {
-        PRINT_DEBUG("MECCHA workshop request: failed to queue %llu", id);
-        return;
-    }
-
-    out << "workshop_id=" << static_cast<unsigned long long>(id) << "\n";
-    out << "reason=" << (reason ? reason : "unknown") << "\n";
-    out << "appid=" << settings->get_local_game_id().AppID() << "\n";
-
-    PRINT_DEBUG("MECCHA workshop request queued item %llu reason='%s'", id, reason ? reason : "unknown");
-}
-
-void Steam_Matchmaking::meccha_set_required_workshop_id(const std::string &id)
-{
-    std::lock_guard<std::recursive_mutex> lock(global_mutex);
-
-    PublishedFileId_t parsed{};
-    if (!id.empty() && !meccha_parse_workshop_id(id, parsed)) {
-        PRINT_DEBUG("MECCHA workshop: rejected invalid ID '%s'", id.c_str());
-        return;
-    }
-
-    meccha_required_workshop_id = id;
-
-    if (!id.empty()) {
-        meccha_write_last_workshop_id(id);
-        meccha_queue_workshop_request(parsed, "host_f8");
-        PRINT_DEBUG("MECCHA workshop: host selected item %s", id.c_str());
-    } else {
-        PRINT_DEBUG("MECCHA workshop: host map cleared");
-    }
-
-    // Update any lobby we already own. New lobbies receive this field during
-    // create_pending_lobbies(). Empty value deliberately clears the field.
-    std::vector<CSteamID> changed_lobbies;
-    for (auto &lobby : lobbies) {
-        if (lobby.deleted()) continue;
-        if (lobby.owner() != settings->get_local_steam_id().ConvertToUint64()) continue;
-
-        auto existing = caseinsensitive_find(lobby.values(), MECCHA_WORKSHOP_LOBBY_KEY);
-        if (existing == lobby.values().end()) {
-            if (!id.empty()) {
-                (*lobby.mutable_values())[MECCHA_WORKSHOP_LOBBY_KEY] = id;
-                changed_lobbies.emplace_back(static_cast<uint64>(lobby.room_id()));
-            }
-        } else if (existing->second != id) {
-            (*lobby.mutable_values())[existing->first] = id;
-            changed_lobbies.emplace_back(static_cast<uint64>(lobby.room_id()));
-        }
-    }
-
-    for (const auto lobby_id : changed_lobbies) {
-        trigger_lobby_dataupdate(lobby_id, lobby_id, true);
-    }
-}
-
-void Steam_Matchmaking::meccha_workshop_tick()
-{
-#ifdef _WIN32
-    const bool f8_down = (GetAsyncKeyState(VK_F8) & 0x8000) != 0;
-    if (f8_down && !meccha_f8_was_down) {
-        const std::string initial = meccha_required_workshop_id.empty()
-            ? meccha_read_last_workshop_id()
-            : meccha_required_workshop_id;
-        meccha_start_workshop_dialog(initial);
-    }
-    meccha_f8_was_down = f8_down;
-
-    std::string result;
-    if (meccha_take_workshop_dialog_result(result)) {
-        meccha_set_required_workshop_id(result);
-    }
-#endif
 }
 
 void Steam_Matchmaking::send_lobby(Lobby const& lobby, CSteamID dest_id)
@@ -1144,19 +1093,22 @@ SteamAPICall_t Steam_Matchmaking::JoinLobby( CSteamID steamIDLobby )
     pending_join.lobby_id = steamIDLobby;
     pending_join.joined = std::chrono::high_resolution_clock::now();
 
-    // If this lobby is already known from discovery, inspect its MECCHA
-    // Workshop requirement before sending the JOIN packet. This keeps the
-    // game out of the lobby until the required map has appeared in the live
-    // workshop cache.
+    bool delay_join = false;
     if (Lobby *known_lobby = get_lobby(steamIDLobby)) {
         const PublishedFileId_t required = meccha_get_lobby_required_workshop(known_lobby);
         if (required != k_PublishedFileIdInvalid && !meccha_is_workshop_installed(required)) {
-            meccha_request_workshop_consent(pending_join, required, "join_lobby");
+            meccha_begin_workshop_consent(
+                steamIDLobby.ConvertToUint64(),
+                required,
+                "join_lobby",
+                settings->get_local_game_id().AppID()
+            );
+            delay_join = true;
             PRINT_DEBUG("MECCHA workshop: delaying lobby join pending permission for item %llu", required);
         }
     }
 
-    if (!pending_join.waiting_for_workshop && !pending_join.waiting_for_workshop_consent) {
+    if (!delay_join) {
         Lobby_Messages *message = new Lobby_Messages();
         message->set_type(Lobby_Messages::JOIN);
         pending_join.message_sent = send_owner_packet(steamIDLobby, message);
@@ -1870,17 +1822,14 @@ void Steam_Matchmaking::create_pending_lobbies()
             lobby.set_type(p_c->eLobbyType);
             lobby.set_owner(settings->get_local_steam_id().ConvertToUint64());
             lobby.set_appid(settings->get_local_game_id().AppID());
+            add_member_to_lobby(&lobby, settings->get_local_steam_id());
 
-            // A Goldberg host that selected a Workshop map with F8 advertises
-            // it as normal lobby metadata. Every patched client sees the same
-            // PublishedFileId before joining.
             if (!meccha_required_workshop_id.empty()) {
                 (*lobby.mutable_values())[MECCHA_WORKSHOP_LOBBY_KEY] = meccha_required_workshop_id;
-                PRINT_DEBUG("MECCHA workshop: new lobby %llu advertising item %s",
-                    lobby.room_id(), meccha_required_workshop_id.c_str());
+                PRINT_DEBUG("MECCHA workshop: advertising item %s on new lobby %llu",
+                    meccha_required_workshop_id.c_str(), lobby.room_id());
             }
 
-            add_member_to_lobby(&lobby, settings->get_local_steam_id());
             lobbies.push_back(lobby);
 
             if (settings->disable_lobby_creation) {
@@ -1932,7 +1881,77 @@ void Steam_Matchmaking::run_background()
 
 void Steam_Matchmaking::RunCallbacks()
 {
-    meccha_workshop_tick();
+#ifdef _WIN32
+    const bool f8_down = (GetAsyncKeyState(VK_F8) & 0x8000) != 0;
+    if (f8_down && !meccha_f8_was_down) {
+        const std::string initial = meccha_required_workshop_id.empty()
+            ? meccha_read_last_workshop_id()
+            : meccha_required_workshop_id;
+        meccha_start_workshop_dialog(initial);
+    }
+    meccha_f8_was_down = f8_down;
+
+    std::string workshop_dialog_result;
+    if (meccha_take_workshop_dialog_result(workshop_dialog_result)) {
+        PublishedFileId_t parsed{};
+        if (workshop_dialog_result.empty() || meccha_parse_workshop_id(workshop_dialog_result, parsed)) {
+            meccha_required_workshop_id = workshop_dialog_result;
+
+            if (!workshop_dialog_result.empty()) {
+                meccha_write_last_workshop_id(workshop_dialog_result);
+                meccha_queue_workshop_request(parsed, "host_f8", settings->get_local_game_id().AppID());
+                PRINT_DEBUG("MECCHA workshop: host selected item %s", workshop_dialog_result.c_str());
+            } else {
+                PRINT_DEBUG("MECCHA workshop: host map cleared");
+            }
+
+            for (auto &lobby : lobbies) {
+                if (lobby.deleted()) continue;
+                if (lobby.owner() != settings->get_local_steam_id().ConvertToUint64()) continue;
+
+                bool changed = false;
+                auto it = lobby.mutable_values()->find(MECCHA_WORKSHOP_LOBBY_KEY);
+                if (workshop_dialog_result.empty()) {
+                    if (it != lobby.mutable_values()->end()) {
+                        lobby.mutable_values()->erase(MECCHA_WORKSHOP_LOBBY_KEY);
+                        changed = true;
+                    }
+                } else if (it == lobby.mutable_values()->end() || it->second != workshop_dialog_result) {
+                    (*lobby.mutable_values())[MECCHA_WORKSHOP_LOBBY_KEY] = workshop_dialog_result;
+                    changed = true;
+                }
+
+                if (changed) {
+                    CSteamID lobby_id(static_cast<uint64>(lobby.room_id()));
+                    trigger_lobby_dataupdate(lobby_id, lobby_id, true);
+                }
+            }
+        }
+    }
+
+    MecchaWorkshopConsentResult consent_result{};
+    if (meccha_take_download_consent_result(consent_result)) {
+        auto state_it = meccha_pending_workshop.find(consent_result.lobby_id);
+        if (state_it != meccha_pending_workshop.end() &&
+            state_it->second.workshop_id == consent_result.workshop_id &&
+            state_it->second.waiting_for_consent) {
+            state_it->second.waiting_for_consent = false;
+            if (consent_result.accepted) {
+                state_it->second.waiting_for_download = true;
+                meccha_queue_workshop_request(
+                    consent_result.workshop_id,
+                    "join_permission_accepted",
+                    settings->get_local_game_id().AppID()
+                );
+                PRINT_DEBUG("MECCHA workshop: permission accepted for item %llu", consent_result.workshop_id);
+            } else {
+                state_it->second.denied = true;
+                PRINT_DEBUG("MECCHA workshop: permission denied for item %llu", consent_result.workshop_id);
+            }
+        }
+    }
+#endif
+
     run_background();
 
     if (searching) {
@@ -2025,73 +2044,45 @@ void Steam_Matchmaking::RunCallbacks()
         search_call_api_id = 0;
     }
 
-#ifdef _WIN32
-    MecchaWorkshopConsentResult consent_result{};
-    if (meccha_take_download_consent_result(consent_result)) {
-        auto consent_join = std::find_if(
-            pending_joins.begin(),
-            pending_joins.end(),
-            [&consent_result](const Pending_Joins &item) {
-                return item.lobby_id.ConvertToUint64() == consent_result.lobby_id &&
-                    item.required_workshop_id == consent_result.workshop_id;
-            }
-        );
-
-        if (consent_join != pending_joins.end() && consent_join->waiting_for_workshop_consent) {
-            consent_join->waiting_for_workshop_consent = false;
-
-            if (consent_result.accepted) {
-                consent_join->waiting_for_workshop = true;
-                consent_join->joined = std::chrono::high_resolution_clock::now();
-                meccha_queue_workshop_request(consent_result.workshop_id, "join_permission_accepted");
-                PRINT_DEBUG("MECCHA workshop: permission accepted for item %llu", consent_result.workshop_id);
-            } else {
-                consent_join->workshop_consent_denied = true;
-                PRINT_DEBUG("MECCHA workshop: permission denied for item %llu", consent_result.workshop_id);
-            }
-        }
-    }
-#endif
-
     auto g = std::begin(pending_joins);
     while (g != std::end(pending_joins)) {
-        if (g->waiting_for_workshop_consent) {
-            // The user has not answered the permission dialog yet. Do not send
-            // the lobby JOIN packet or apply the normal network timeout.
-            ++g;
-            continue;
-        }
-
-        if (g->workshop_consent_denied) {
-            // A direct join may have sent a JOIN before its lobby metadata was
-            // known. If that happened, leave again before reporting failure.
-            if (Lobby *joined_lobby = get_lobby(g->lobby_id)) {
-                if (get_lobby_member(joined_lobby, settings->get_local_steam_id())) {
-                    LeaveLobby(g->lobby_id);
-                }
-            }
-
-            LobbyEnter_t data{};
-            data.m_ulSteamIDLobby = g->lobby_id.ConvertToUint64();
-            data.m_rgfChatPermissions = 0;
-            data.m_bLocked = false;
-            data.m_EChatRoomEnterResponse = k_EChatRoomEnterResponseNotAllowed;
-            callback_results->addCallResult(g->api_id, data.k_iCallback, &data, sizeof(data));
-            callbacks->addCBResult(data.k_iCallback, &data, sizeof(data));
-            g = pending_joins.erase(g);
-            continue;
-        }
-        if (g->waiting_for_workshop) {
-            if (meccha_is_workshop_installed(g->required_workshop_id)) {
-                PRINT_DEBUG("MECCHA workshop: item %llu installed, continuing lobby join", g->required_workshop_id);
-                g->waiting_for_workshop = false;
-                g->joined = std::chrono::high_resolution_clock::now();
-            } else {
-                // Do not apply the normal network join timeout while content is
-                // still being acquired. A downloader will satisfy the request
-                // by populating workshop_cache/<id>.
+        const uint64 meccha_lobby_id = g->lobby_id.ConvertToUint64();
+        auto workshop_state = meccha_pending_workshop.find(meccha_lobby_id);
+        if (workshop_state != meccha_pending_workshop.end()) {
+            if (workshop_state->second.waiting_for_consent) {
                 ++g;
                 continue;
+            }
+
+            if (workshop_state->second.denied) {
+                if (Lobby *joined_lobby = get_lobby(g->lobby_id)) {
+                    if (get_lobby_member(joined_lobby, settings->get_local_steam_id())) {
+                        LeaveLobby(g->lobby_id);
+                    }
+                }
+
+                LobbyEnter_t data{};
+                data.m_ulSteamIDLobby = meccha_lobby_id;
+                data.m_rgfChatPermissions = 0;
+                data.m_bLocked = false;
+                data.m_EChatRoomEnterResponse = k_EChatRoomEnterResponseNotAllowed;
+                callback_results->addCallResult(g->api_id, data.k_iCallback, &data, sizeof(data));
+                callbacks->addCBResult(data.k_iCallback, &data, sizeof(data));
+                meccha_pending_workshop.erase(workshop_state);
+                g = pending_joins.erase(g);
+                continue;
+            }
+
+            if (workshop_state->second.waiting_for_download) {
+                if (meccha_is_workshop_installed(workshop_state->second.workshop_id)) {
+                    PRINT_DEBUG("MECCHA workshop: item %llu installed, continuing lobby join", workshop_state->second.workshop_id);
+                    workshop_state->second.waiting_for_download = false;
+                    g->joined = std::chrono::high_resolution_clock::now();
+                    meccha_pending_workshop.erase(workshop_state);
+                } else {
+                    ++g;
+                    continue;
+                }
             }
         }
 
@@ -2107,32 +2098,35 @@ void Steam_Matchmaking::RunCallbacks()
             PRINT_DEBUG("lobby deleted %llu", g->lobby_id.ConvertToUint64());
             LobbyEnter_t data{};
             data.m_ulSteamIDLobby = lobby->room_id();
-            data.m_rgfChatPermissions = 0; //Unused - Always 0
+            data.m_rgfChatPermissions = 0;
             data.m_bLocked = false;
             data.m_EChatRoomEnterResponse = k_EChatRoomEnterResponseDoesntExist;
             callback_results->addCallResult(g->api_id, data.k_iCallback, &data, sizeof(data));
             callbacks->addCBResult(data.k_iCallback, &data, sizeof(data));
+            meccha_pending_workshop.erase(meccha_lobby_id);
             g = pending_joins.erase(g);
-        } else if (get_lobby_member(lobby, settings->get_local_steam_id())) {
+        } else if (lobby && get_lobby_member(lobby, settings->get_local_steam_id())) {
             PRINT_DEBUG("lobby joined %llu", g->lobby_id.ConvertToUint64());
             LobbyEnter_t data{};
             data.m_ulSteamIDLobby = lobby->room_id();
-            data.m_rgfChatPermissions = 0; //Unused - Always 0
+            data.m_rgfChatPermissions = 0;
             data.m_bLocked = false;
             data.m_EChatRoomEnterResponse = k_EChatRoomEnterResponseSuccess;
             callback_results->addCallResult(g->api_id, data.k_iCallback, &data, sizeof(data));
             callbacks->addCBResult(data.k_iCallback, &data, sizeof(data));
+            meccha_pending_workshop.erase(meccha_lobby_id);
             g = pending_joins.erase(g);
             trigger_lobby_dataupdate((uint64)lobby->room_id(), (uint64)lobby->room_id(), true);
         } else if (check_timedout(g->joined, PENDING_JOIN_TIMEOUT)) {
             PRINT_DEBUG("pending join timeout %llu", g->lobby_id.ConvertToUint64());
             LobbyEnter_t data{};
             data.m_ulSteamIDLobby = g->lobby_id.ConvertToUint64();
-            data.m_rgfChatPermissions = 0; //Unused - Always 0
+            data.m_rgfChatPermissions = 0;
             data.m_bLocked = false;
             data.m_EChatRoomEnterResponse = k_EChatRoomEnterResponseDoesntExist;
             callback_results->addCallResult(g->api_id, data.k_iCallback, &data, sizeof(data));
             callbacks->addCBResult(data.k_iCallback, &data, sizeof(data));
+            meccha_pending_workshop.erase(meccha_lobby_id);
             g = pending_joins.erase(g);
         } else {
             ++g;
@@ -2167,25 +2161,26 @@ void Steam_Matchmaking::Callback(Common_Message *msg)
         if (msg->lobby().owner() != settings->get_local_steam_id().ConvertToUint64() && msg->lobby().appid() == settings->get_local_game_id().AppID()) {
             search_waiting_for_initial_sync = false;
 
-            // Fallback for direct joins where the lobby metadata was not known
-            // when JoinLobby() was first called. If this is the lobby we are
-            // joining, queue its Workshop item as soon as the metadata arrives.
             PublishedFileId_t incoming_required = k_PublishedFileIdInvalid;
-            auto incoming_required_it = caseinsensitive_find(msg->lobby().values(), MECCHA_WORKSHOP_LOBBY_KEY);
-            if (incoming_required_it != msg->lobby().values().end()) {
-                meccha_parse_workshop_id(incoming_required_it->second, incoming_required);
+            auto incoming_it = msg->lobby().values().find(MECCHA_WORKSHOP_LOBBY_KEY);
+            if (incoming_it != msg->lobby().values().end()) {
+                meccha_parse_workshop_id(incoming_it->second, incoming_required);
             }
 
             if (incoming_required != k_PublishedFileIdInvalid && !meccha_is_workshop_installed(incoming_required)) {
-                const CSteamID incoming_lobby_id(static_cast<uint64>(msg->lobby().room_id()));
-                auto pending = std::find_if(pending_joins.begin(), pending_joins.end(), [&incoming_lobby_id](const Pending_Joins &item) {
-                    return item.lobby_id == incoming_lobby_id;
+                const uint64 incoming_lobby_id = static_cast<uint64>(msg->lobby().room_id());
+                CSteamID incoming_lobby_steam_id(incoming_lobby_id);
+                auto pending = std::find_if(pending_joins.begin(), pending_joins.end(), [&incoming_lobby_steam_id](const Pending_Joins &item) {
+                    return item.lobby_id == incoming_lobby_steam_id;
                 });
-                if (pending != pending_joins.end() &&
-                    !pending->waiting_for_workshop &&
-                    !pending->waiting_for_workshop_consent &&
-                    !pending->workshop_consent_denied) {
-                    meccha_request_workshop_consent(*pending, incoming_required, "join_lobby_metadata");
+
+                if (pending != pending_joins.end() && meccha_pending_workshop.find(incoming_lobby_id) == meccha_pending_workshop.end()) {
+                    meccha_begin_workshop_consent(
+                        incoming_lobby_id,
+                        incoming_required,
+                        "join_lobby_metadata",
+                        settings->get_local_game_id().AppID()
+                    );
                 }
             }
 
@@ -2224,11 +2219,11 @@ void Steam_Matchmaking::Callback(Common_Message *msg)
                                 auto pd = pending_joins.begin();
                                 while (pd != pending_joins.end()) {
                                     if (pd->lobby_id == id) {
-                                        if (pd->waiting_for_workshop) {
-                                            // The host may have acknowledged a direct JOIN before
-                                            // its metadata reached us. Keep the Steam-style lobby
-                                            // enter callback blocked until workshop_cache/<id> is
-                                            // populated. RunCallbacks() will finish the join then.
+                                        auto workshop_state = meccha_pending_workshop.find(id.ConvertToUint64());
+                                        if (workshop_state != meccha_pending_workshop.end() &&
+                                            (workshop_state->second.waiting_for_consent ||
+                                             workshop_state->second.waiting_for_download ||
+                                             workshop_state->second.denied)) {
                                             ++pd;
                                             continue;
                                         }
@@ -2241,6 +2236,7 @@ void Steam_Matchmaking::Callback(Common_Message *msg)
                                         data.m_EChatRoomEnterResponse = success ? k_EChatRoomEnterResponseSuccess : k_EChatRoomEnterResponseError;
                                         callback_results->addCallResult(pd->api_id, data.k_iCallback, &data, sizeof(data));
                                         callbacks->addCBResult(data.k_iCallback, &data, sizeof(data));
+                                        meccha_pending_workshop.erase(id.ConvertToUint64());
                                         pd = pending_joins.erase(pd);
                                         joined = true;
                                     } else {
