@@ -18,6 +18,167 @@
 #include "dll/steam_ugc.h"
 #include "dll/dll.h"
 
+#include <filesystem>
+
+
+namespace {
+
+static std::filesystem::path get_live_workshop_root()
+{
+    return std::filesystem::u8path(Local_Storage::get_game_settings_path()) / "workshop_cache";
+}
+
+static bool parse_live_workshop_id(const std::filesystem::path &folder, PublishedFileId_t &out_id)
+{
+    const std::string name = folder.filename().string();
+    if (name.empty()) return false;
+
+    for (char ch : name) {
+        if (ch < '0' || ch > '9') return false;
+    }
+
+    try {
+        const unsigned long long parsed = std::stoull(name);
+        if (!parsed || parsed == static_cast<unsigned long long>(k_PublishedFileIdInvalid)) {
+            return false;
+        }
+
+        out_id = static_cast<PublishedFileId_t>(parsed);
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
+static uint64 get_live_workshop_folder_size(const std::filesystem::path &folder)
+{
+    uint64 total = 0;
+
+    try {
+        for (const auto &entry : std::filesystem::recursive_directory_iterator(
+                 folder,
+                 std::filesystem::directory_options::skip_permission_denied)) {
+            std::error_code ec;
+            if (!entry.is_regular_file(ec) || ec) continue;
+
+            const auto size = entry.file_size(ec);
+            if (!ec) {
+                total += static_cast<uint64>(size);
+            }
+        }
+    } catch (...) {
+        // A locked or partially-written file must not break UGC enumeration.
+    }
+
+    return total;
+}
+
+static std::set<PublishedFileId_t> scan_live_workshop_cache()
+{
+    std::set<PublishedFileId_t> ids;
+    const auto root = get_live_workshop_root();
+
+    std::error_code ec;
+    if (!std::filesystem::is_directory(root, ec) || ec) {
+        return ids;
+    }
+
+    try {
+        for (const auto &entry : std::filesystem::directory_iterator(
+                 root,
+                 std::filesystem::directory_options::skip_permission_denied)) {
+            std::error_code entry_ec;
+            if (!entry.is_directory(entry_ec) || entry_ec) continue;
+
+            PublishedFileId_t id = k_PublishedFileIdInvalid;
+            if (parse_live_workshop_id(entry.path(), id)) {
+                ids.insert(id);
+            }
+        }
+    } catch (...) {
+        // Treat an unreadable cache as empty for this refresh.
+    }
+
+    return ids;
+}
+
+static bool get_live_workshop_folder(PublishedFileId_t id, std::string &out_folder)
+{
+    const auto folder =
+        get_live_workshop_root() /
+        std::to_string(static_cast<unsigned long long>(id));
+
+    std::error_code ec;
+    if (!std::filesystem::is_directory(folder, ec) || ec) {
+        return false;
+    }
+
+    out_folder = folder.string();
+    return true;
+}
+
+static void refresh_live_workshop_cache(Settings *settings, Ugc_Remote_Storage_Bridge *ugc_bridge)
+{
+    // Track only state injected by this live-cache layer so a normal mods.json
+    // subscription is never removed accidentally.
+    static std::set<PublishedFileId_t> live_settings_ids;
+    static std::set<PublishedFileId_t> live_bridge_ids;
+
+    const auto current = scan_live_workshop_cache();
+
+    for (auto it = live_bridge_ids.begin(); it != live_bridge_ids.end(); ) {
+        const auto id = *it;
+
+        if (!current.count(id)) {
+            if (ugc_bridge->has_subbed_mod(id)) {
+                PRINT_DEBUG("live workshop cache removed item %llu", id);
+                ugc_bridge->remove_subbed_mod(id);
+            }
+
+            it = live_bridge_ids.erase(it);
+        } else {
+            ++it;
+        }
+    }
+
+    for (const auto id : current) {
+        std::string folder;
+        if (!get_live_workshop_folder(id, folder)) continue;
+
+        // Preserve richer mods.json metadata unless this item was originally
+        // created by the live-cache layer. Live items are refreshed so their
+        // path and size can change without restarting the game.
+        if (!settings->isModInstalled(id) || live_settings_ids.count(id)) {
+            Mod_entry mod{};
+            mod.path = folder;
+            mod.title =
+                std::string("Workshop ") +
+                std::to_string(static_cast<unsigned long long>(id));
+            mod.primaryFileName = "";
+            mod.acceptedForUse = true;
+            mod.primaryFileSize =
+                get_live_workshop_folder_size(std::filesystem::u8path(folder));
+            mod.total_files_sizes = mod.primaryFileSize;
+
+            settings->addModDetails(id, mod);
+            live_settings_ids.insert(id);
+
+            PRINT_DEBUG(
+                "live workshop cache registered item %llu at '%s'",
+                id,
+                folder.c_str()
+            );
+        }
+
+        if (!ugc_bridge->has_subbed_mod(id)) {
+            ugc_bridge->add_subbed_mod(id);
+            live_bridge_ids.insert(id);
+        }
+    }
+}
+
+} // namespace
+
 UGCQueryHandle_t Steam_UGC::new_ugc_query(EQueryType query_type, bool return_all_subscribed, uint32 page, bool next_cursor, const std::set<PublishedFileId_t> &return_only)
 {
     std::lock_guard<std::recursive_mutex> lock(global_mutex);
@@ -209,6 +370,7 @@ SteamAPICall_t Steam_UGC::internal_RequestUGCDetails( PublishedFileId_t nPublish
 {
     PRINT_DEBUG("%llu %u <%u>", nPublishedFileID, unMaxAgeSeconds, (unsigned)ver);
     std::lock_guard<std::recursive_mutex> lock(global_mutex);
+    refresh_live_workshop_cache(settings, ugc_bridge);
     
     if (ver <= IUgcItfVersion::v018) { // <= SDK 1.59
         SteamUGCRequestUGCDetailsResult018_t data{};
@@ -239,6 +401,7 @@ Steam_UGC::Steam_UGC(class Settings *settings, class Ugc_Remote_Storage_Bridge *
     this->callback_results = callback_results;
 
     read_ugc_favorites();
+    refresh_live_workshop_cache(settings, ugc_bridge);
 }
 
 
@@ -336,6 +499,7 @@ SteamAPICall_t Steam_UGC::SendQueryUGCRequest( UGCQueryHandle_t handle )
 {
     PRINT_DEBUG("%llu", handle);
     std::lock_guard<std::recursive_mutex> lock(global_mutex);
+    refresh_live_workshop_cache(settings, ugc_bridge);
     
     const auto trigger_failure = [handle, this](){
         SteamUGCQueryCompleted_t data{};
@@ -1413,6 +1577,7 @@ uint32 Steam_UGC::GetNumSubscribedItems( bool bIncludeLocallyDisabled )
 {
     PRINT_DEBUG(" %d", (int)bIncludeLocallyDisabled);
     std::lock_guard<std::recursive_mutex> lock(global_mutex);
+    refresh_live_workshop_cache(settings, ugc_bridge);
     
     std::set<PublishedFileId_t> subscribed_enabled = std::set<PublishedFileId_t>(ugc_bridge->subbed_mods_itr_begin(), ugc_bridge->subbed_mods_itr_end());
     if (!bIncludeLocallyDisabled) {
@@ -1437,6 +1602,7 @@ uint32 Steam_UGC::GetSubscribedItems( PublishedFileId_t* pvecPublishedFileID, ui
 {
     PRINT_DEBUG("%p %u %d", pvecPublishedFileID, cMaxEntries, (int)bIncludeLocallyDisabled);
     std::lock_guard<std::recursive_mutex> lock(global_mutex);
+    refresh_live_workshop_cache(settings, ugc_bridge);
 
     std::set<PublishedFileId_t> subscribed_enabled = std::set<PublishedFileId_t>(ugc_bridge->subbed_mods_itr_begin(), ugc_bridge->subbed_mods_itr_end());
     if (!bIncludeLocallyDisabled) {
@@ -1462,6 +1628,7 @@ uint32 Steam_UGC::GetItemState( PublishedFileId_t nPublishedFileID )
 {
     PRINT_DEBUG("%llu", nPublishedFileID);
     std::lock_guard<std::recursive_mutex> lock(global_mutex);
+    refresh_live_workshop_cache(settings, ugc_bridge);
     
     if (!settings->isModInstalled(nPublishedFileID)) {
         PRINT_DEBUG("  mod isn't found");
@@ -1491,6 +1658,7 @@ bool Steam_UGC::GetItemInstallInfo( PublishedFileId_t nPublishedFileID, uint64 *
 {
     PRINT_DEBUG("%llu %p %p [%u] %p", nPublishedFileID, punSizeOnDisk, pchFolder, cchFolderSize, punTimeStamp);
     std::lock_guard<std::recursive_mutex> lock(global_mutex);
+    refresh_live_workshop_cache(settings, ugc_bridge);
     if (!cchFolderSize) return false;
     if (!settings->isModInstalled(nPublishedFileID)) return false;
 
@@ -1520,6 +1688,7 @@ bool Steam_UGC::GetItemDownloadInfo( PublishedFileId_t nPublishedFileID, uint64 
 {
     PRINT_DEBUG("%llu", nPublishedFileID);
     std::lock_guard<std::recursive_mutex> lock(global_mutex);
+    refresh_live_workshop_cache(settings, ugc_bridge);
     if (!settings->isModInstalled(nPublishedFileID)) return false;
 
     auto mod = settings->getMod(nPublishedFileID);
@@ -1560,6 +1729,7 @@ bool Steam_UGC::DownloadItem( PublishedFileId_t nPublishedFileID, bool bHighPrio
 {
     PRINT_DEBUG("%llu %i // TODO", nPublishedFileID, (int)bHighPriority);
     std::lock_guard<std::recursive_mutex> lock(global_mutex);
+    refresh_live_workshop_cache(settings, ugc_bridge);
     
     if (!settings->isModInstalled(nPublishedFileID)) {
         DownloadItemResult_t data_fail{};
