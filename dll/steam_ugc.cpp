@@ -19,6 +19,18 @@
 #include "dll/dll.h"
 
 #include <filesystem>
+#include <fstream>
+#include <sstream>
+
+#ifdef _WIN32
+#include <windows.h>
+#include <winhttp.h>
+#include <urlmon.h>
+#ifdef _MSC_VER
+#pragma comment(lib, "Winhttp.lib")
+#pragma comment(lib, "Urlmon.lib")
+#endif
+#endif
 
 
 namespace {
@@ -117,6 +129,326 @@ static bool get_live_workshop_folder(PublishedFileId_t id, std::string &out_fold
     return true;
 }
 
+static uint64 json_u64(const nlohmann::json &value, uint64 fallback = 0)
+{
+    try {
+        if (value.is_number_unsigned()) return value.get<uint64>();
+        if (value.is_number_integer()) {
+            const auto parsed = value.get<int64>();
+            return parsed > 0 ? static_cast<uint64>(parsed) : fallback;
+        }
+        if (value.is_string()) {
+            const auto text = value.get<std::string>();
+            if (!text.empty()) return static_cast<uint64>(std::stoull(text));
+        }
+    } catch (...) {
+    }
+
+    return fallback;
+}
+
+static uint32 json_u32(const nlohmann::json &value, uint32 fallback = 0)
+{
+    const uint64 parsed = json_u64(value, fallback);
+    if (parsed > 0xFFFFFFFFull) return 0xFFFFFFFFu;
+    return static_cast<uint32>(parsed);
+}
+
+static int32 json_i32_size(const nlohmann::json &value, int32 fallback = 0)
+{
+    const uint64 parsed = json_u64(value, static_cast<uint64>(fallback > 0 ? fallback : 0));
+    if (parsed > 0x7FFFFFFFull) return 0x7FFFFFFF;
+    return static_cast<int32>(parsed);
+}
+
+static std::filesystem::path live_workshop_metadata_path(PublishedFileId_t id)
+{
+    return get_live_workshop_root() /
+        std::to_string(static_cast<unsigned long long>(id)) /
+        ".meccha_workshop_meta.json";
+}
+
+#ifdef _WIN32
+static bool fetch_live_workshop_metadata(PublishedFileId_t id)
+{
+    const auto metadata_path = live_workshop_metadata_path(id);
+
+    std::error_code ec;
+    if (std::filesystem::is_regular_file(metadata_path, ec) && !ec) {
+        const auto size = std::filesystem::file_size(metadata_path, ec);
+        if (!ec && size > 32) return true;
+    }
+
+    HINTERNET session = WinHttpOpen(
+        L"MECCHA-Workshop-Metadata/1.0",
+        WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+        WINHTTP_NO_PROXY_NAME,
+        WINHTTP_NO_PROXY_BYPASS,
+        0
+    );
+    if (!session) return false;
+
+    WinHttpSetTimeouts(session, 5000, 5000, 5000, 8000);
+
+    HINTERNET connection = WinHttpConnect(
+        session,
+        L"api.steampowered.com",
+        INTERNET_DEFAULT_HTTPS_PORT,
+        0
+    );
+    if (!connection) {
+        WinHttpCloseHandle(session);
+        return false;
+    }
+
+    HINTERNET request = WinHttpOpenRequest(
+        connection,
+        L"POST",
+        L"/ISteamRemoteStorage/GetPublishedFileDetails/v1/",
+        nullptr,
+        WINHTTP_NO_REFERER,
+        WINHTTP_DEFAULT_ACCEPT_TYPES,
+        WINHTTP_FLAG_SECURE
+    );
+    if (!request) {
+        WinHttpCloseHandle(connection);
+        WinHttpCloseHandle(session);
+        return false;
+    }
+
+    const std::string id_text = std::to_string(static_cast<unsigned long long>(id));
+    const std::string body =
+        std::string("itemcount=1&publishedfileids%5B0%5D=") + id_text;
+
+    const wchar_t headers[] =
+        L"Content-Type: application/x-www-form-urlencoded\r\n";
+
+    bool ok =
+        !!WinHttpSendRequest(
+            request,
+            headers,
+            static_cast<DWORD>(-1L),
+            const_cast<char *>(body.data()),
+            static_cast<DWORD>(body.size()),
+            static_cast<DWORD>(body.size()),
+            0
+        ) &&
+        !!WinHttpReceiveResponse(request, nullptr);
+
+    std::string response;
+
+    if (ok) {
+        DWORD status_code = 0;
+        DWORD status_size = sizeof(status_code);
+        if (!WinHttpQueryHeaders(
+                request,
+                WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+                WINHTTP_HEADER_NAME_BY_INDEX,
+                &status_code,
+                &status_size,
+                WINHTTP_NO_HEADER_INDEX) ||
+            status_code < 200 || status_code >= 300) {
+            ok = false;
+        }
+    }
+
+    while (ok) {
+        DWORD available = 0;
+        if (!WinHttpQueryDataAvailable(request, &available)) {
+            ok = false;
+            break;
+        }
+
+        if (!available) break;
+
+        const size_t old_size = response.size();
+        response.resize(old_size + available);
+
+        DWORD read = 0;
+        if (!WinHttpReadData(
+                request,
+                response.data() + old_size,
+                available,
+                &read)) {
+            ok = false;
+            break;
+        }
+
+        response.resize(old_size + read);
+        if (!read) break;
+    }
+
+    WinHttpCloseHandle(request);
+    WinHttpCloseHandle(connection);
+    WinHttpCloseHandle(session);
+
+    if (!ok || response.empty()) return false;
+
+    try {
+        const auto parsed = nlohmann::json::parse(response);
+        const auto &details = parsed.at("response").at("publishedfiledetails");
+        if (!details.is_array() || details.empty()) return false;
+        if (json_u32(details.at(0).value("result", 0), 0) != 1) return false;
+    } catch (...) {
+        return false;
+    }
+
+    std::filesystem::create_directories(metadata_path.parent_path(), ec);
+    ec.clear();
+
+    std::ofstream out(metadata_path, std::ios::binary | std::ios::trunc);
+    if (!out) return false;
+
+    out.write(response.data(), static_cast<std::streamsize>(response.size()));
+    out.close();
+
+    PRINT_DEBUG(
+        "live workshop metadata fetched for item %llu",
+        id
+    );
+
+    return true;
+}
+#else
+static bool fetch_live_workshop_metadata(PublishedFileId_t)
+{
+    return false;
+}
+#endif
+
+static void apply_live_workshop_metadata(
+    Settings *settings,
+    PublishedFileId_t id,
+    const std::filesystem::path &folder,
+    Mod_entry &mod
+)
+{
+    fetch_live_workshop_metadata(id);
+
+    const auto metadata_path = live_workshop_metadata_path(id);
+    std::ifstream in(metadata_path, std::ios::binary);
+    if (!in) return;
+
+    try {
+        nlohmann::json root;
+        in >> root;
+
+        const auto &items = root.at("response").at("publishedfiledetails");
+        if (!items.is_array() || items.empty()) return;
+
+        const auto &details = items.at(0);
+        if (json_u32(details.value("result", 0), 0) != 1) return;
+
+        mod.title = details.value("title", mod.title);
+        mod.description = details.value("description", std::string{});
+        mod.steamIDOwner = json_u64(
+            details.contains("creator") ? details.at("creator") : nlohmann::json{},
+            settings->get_local_steam_id().ConvertToUint64()
+        );
+        mod.timeCreated = json_u32(
+            details.contains("time_created") ? details.at("time_created") : nlohmann::json{},
+            0
+        );
+        mod.timeUpdated = json_u32(
+            details.contains("time_updated") ? details.at("time_updated") : nlohmann::json{},
+            0
+        );
+        mod.timeAddedToUserList = mod.timeUpdated ? mod.timeUpdated : mod.timeCreated;
+        mod.visibility = static_cast<ERemoteStoragePublishedFileVisibility>(
+            json_u32(
+                details.contains("visibility") ? details.at("visibility") : nlohmann::json{},
+                static_cast<uint32>(k_ERemoteStoragePublishedFileVisibilityPublic)
+            )
+        );
+        mod.primaryFileSize = json_i32_size(
+            details.contains("file_size") ? details.at("file_size") : nlohmann::json{},
+            mod.primaryFileSize
+        );
+        mod.previewURL = details.value("preview_url", std::string{});
+        mod.workshopItemURL =
+            std::string("https://steamcommunity.com/sharedfiles/filedetails/?id=") +
+            std::to_string(static_cast<unsigned long long>(id));
+
+        if (details.contains("tags") && details.at("tags").is_array()) {
+            std::string tags;
+            for (const auto &entry : details.at("tags")) {
+                const std::string tag = entry.value("tag", std::string{});
+                if (tag.empty()) continue;
+                if (!tags.empty()) tags.push_back(',');
+                tags += tag;
+            }
+            mod.tags = std::move(tags);
+        }
+
+#ifdef _WIN32
+        if (!mod.previewURL.empty()) {
+            const auto preview_dir =
+                std::filesystem::u8path(Local_Storage::get_game_settings_path()) /
+                "mod_images" /
+                std::to_string(static_cast<unsigned long long>(id));
+
+            std::error_code ec;
+            std::filesystem::create_directories(preview_dir, ec);
+
+            const auto preview_path = preview_dir / "preview.jpg";
+
+            if (!std::filesystem::is_regular_file(preview_path, ec) || ec) {
+                ec.clear();
+                const HRESULT hr = URLDownloadToFileA(
+                    nullptr,
+                    mod.previewURL.c_str(),
+                    preview_path.string().c_str(),
+                    0,
+                    nullptr
+                );
+
+                if (FAILED(hr)) {
+                    PRINT_DEBUG(
+                        "live workshop preview download failed for item %llu",
+                        id
+                    );
+                }
+            }
+
+            ec.clear();
+            if (std::filesystem::is_regular_file(preview_path, ec) && !ec) {
+                mod.previewFileName = "preview.jpg";
+
+                const auto preview_size = std::filesystem::file_size(preview_path, ec);
+                if (!ec) {
+                    mod.previewFileSize =
+                        preview_size > 0x7FFFFFFFull
+                            ? 0x7FFFFFFF
+                            : static_cast<int32>(preview_size);
+                }
+
+                std::string local_preview = preview_path.string();
+                std::replace(local_preview.begin(), local_preview.end(), '\\', '/');
+                mod.previewURL = "file:///" + local_preview;
+            }
+        }
+#endif
+
+        PRINT_DEBUG(
+            "live workshop metadata item %llu title='%s' preview='%s'",
+            id,
+            mod.title.c_str(),
+            mod.previewURL.c_str()
+        );
+    } catch (const std::exception &e) {
+        PRINT_DEBUG(
+            "live workshop metadata parse failed for item %llu: %s",
+            id,
+            e.what()
+        );
+    } catch (...) {
+        PRINT_DEBUG(
+            "live workshop metadata parse failed for item %llu",
+            id
+        );
+    }
+}
+
 static void refresh_live_workshop_cache(Settings *settings, Ugc_Remote_Storage_Bridge *ugc_bridge)
 {
     // Track only state injected by this live-cache layer so a normal mods.json
@@ -150,15 +482,29 @@ static void refresh_live_workshop_cache(Settings *settings, Ugc_Remote_Storage_B
         // path and size can change without restarting the game.
         if (!settings->isModInstalled(id) || live_settings_ids.count(id)) {
             Mod_entry mod{};
+            mod.id = id;
             mod.path = folder;
             mod.title =
                 std::string("Workshop ") +
                 std::to_string(static_cast<unsigned long long>(id));
+            mod.fileType = k_EWorkshopFileTypeCommunity;
+            mod.visibility = k_ERemoteStoragePublishedFileVisibilityPublic;
+            mod.steamIDOwner = settings->get_local_steam_id().ConvertToUint64();
             mod.primaryFileName = "";
             mod.acceptedForUse = true;
             mod.primaryFileSize =
                 get_live_workshop_folder_size(std::filesystem::u8path(folder));
             mod.total_files_sizes = mod.primaryFileSize;
+            mod.workshopItemURL =
+                std::string("https://steamcommunity.com/sharedfiles/filedetails/?id=") +
+                std::to_string(static_cast<unsigned long long>(id));
+
+            apply_live_workshop_metadata(
+                settings,
+                id,
+                std::filesystem::u8path(folder),
+                mod
+            );
 
             settings->addMod(id, mod.title, mod.path);
             settings->addModDetails(id, mod);
