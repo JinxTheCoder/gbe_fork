@@ -160,6 +160,7 @@ static void refresh_live_workshop_cache(Settings *settings, Ugc_Remote_Storage_B
                 get_live_workshop_folder_size(std::filesystem::u8path(folder));
             mod.total_files_sizes = mod.primaryFileSize;
 
+            settings->addMod(id, mod.title, mod.path);
             settings->addModDetails(id, mod);
             live_settings_ids.insert(id);
 
