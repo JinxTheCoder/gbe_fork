@@ -23,12 +23,15 @@
 #include <map>
 #include <mutex>
 #include <thread>
+#include <vector>
 
 #ifdef _WIN32
 #include <windows.h>
+#include <urlmon.h>
 #ifdef _MSC_VER
 #pragma comment(lib, "User32.lib")
 #pragma comment(lib, "Gdi32.lib")
+#pragma comment(lib, "Urlmon.lib")
 #endif
 #endif
 
@@ -392,6 +395,282 @@ static PublishedFileId_t meccha_get_lobby_required_workshop(const Lobby *lobby)
     return id;
 }
 
+#ifdef _WIN32
+
+enum class MecchaWorkshopDownloadStatus {
+    none,
+    downloading,
+    installed,
+    failed,
+};
+
+struct MecchaWorkshopDownloadRecord {
+    MecchaWorkshopDownloadStatus status{MecchaWorkshopDownloadStatus::none};
+    std::string error{};
+};
+
+static std::mutex meccha_download_mutex;
+static std::map<PublishedFileId_t, MecchaWorkshopDownloadRecord> meccha_downloads;
+
+static std::mutex meccha_download_notice_mutex;
+static std::vector<std::string> meccha_download_notices;
+static std::vector<PublishedFileId_t> meccha_completed_downloads;
+
+static bool meccha_directory_has_files(const std::filesystem::path &path)
+{
+    std::error_code ec;
+    if (!std::filesystem::is_directory(path, ec) || ec) return false;
+
+    for (std::filesystem::recursive_directory_iterator it(path, ec), end; !ec && it != end; it.increment(ec)) {
+        if (it->is_regular_file(ec) && !ec) return true;
+    }
+
+    return false;
+}
+
+static void meccha_push_download_notice(const std::string &message)
+{
+    std::lock_guard<std::mutex> lock(meccha_download_notice_mutex);
+    meccha_download_notices.push_back(message);
+}
+
+static bool meccha_take_download_notice(std::string &message)
+{
+    std::lock_guard<std::mutex> lock(meccha_download_notice_mutex);
+    if (meccha_download_notices.empty()) return false;
+
+    message = std::move(meccha_download_notices.front());
+    meccha_download_notices.erase(meccha_download_notices.begin());
+    return true;
+}
+
+static void meccha_push_completed_download(PublishedFileId_t id)
+{
+    std::lock_guard<std::mutex> lock(meccha_download_notice_mutex);
+    meccha_completed_downloads.push_back(id);
+}
+
+static bool meccha_take_completed_download(PublishedFileId_t &id)
+{
+    std::lock_guard<std::mutex> lock(meccha_download_notice_mutex);
+    if (meccha_completed_downloads.empty()) return false;
+
+    id = meccha_completed_downloads.front();
+    meccha_completed_downloads.erase(meccha_completed_downloads.begin());
+    return true;
+}
+
+static bool meccha_run_hidden_process(const std::string &command_line, const std::filesystem::path &working_dir, DWORD &exit_code)
+{
+    std::string mutable_command = command_line;
+
+    STARTUPINFOA startup{};
+    startup.cb = sizeof(startup);
+    startup.dwFlags = STARTF_USESHOWWINDOW;
+    startup.wShowWindow = SW_HIDE;
+
+    PROCESS_INFORMATION process{};
+    const std::string working = working_dir.string();
+
+    const BOOL created = CreateProcessA(
+        nullptr,
+        mutable_command.data(),
+        nullptr,
+        nullptr,
+        FALSE,
+        CREATE_NO_WINDOW,
+        nullptr,
+        working.empty() ? nullptr : working.c_str(),
+        &startup,
+        &process
+    );
+
+    if (!created) {
+        exit_code = GetLastError();
+        return false;
+    }
+
+    WaitForSingleObject(process.hProcess, INFINITE);
+    if (!GetExitCodeProcess(process.hProcess, &exit_code)) {
+        exit_code = GetLastError();
+        CloseHandle(process.hThread);
+        CloseHandle(process.hProcess);
+        return false;
+    }
+
+    CloseHandle(process.hThread);
+    CloseHandle(process.hProcess);
+    return true;
+}
+
+static bool meccha_bootstrap_steamcmd(const std::filesystem::path &tool_dir, std::string &error)
+{
+    std::error_code ec;
+    std::filesystem::create_directories(tool_dir, ec);
+    if (ec) {
+        error = "Could not create the SteamCMD tools directory.";
+        return false;
+    }
+
+    const auto steamcmd_exe = tool_dir / "steamcmd.exe";
+    if (std::filesystem::is_regular_file(steamcmd_exe, ec) && !ec) return true;
+
+    const auto zip_path = tool_dir / "steamcmd.zip";
+    constexpr const char steamcmd_url[] = "https://steamcdn-a.akamaihd.net/client/installer/steamcmd.zip";
+
+    PRINT_DEBUG("MECCHA workshop: downloading official Valve SteamCMD bootstrap");
+    const HRESULT hr = URLDownloadToFileA(nullptr, steamcmd_url, zip_path.string().c_str(), 0, nullptr);
+    if (FAILED(hr)) {
+        error = "Could not download SteamCMD from Valve.";
+        return false;
+    }
+
+    DWORD exit_code{};
+    std::string tar_command = "tar.exe -xf \"" + zip_path.string() + "\" -C \"" + tool_dir.string() + "\"";
+    bool extracted = meccha_run_hidden_process(tar_command, tool_dir, exit_code) && exit_code == 0;
+
+    if (!extracted) {
+        std::string ps_command =
+            "powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command \"Expand-Archive -LiteralPath '" +
+            zip_path.string() + "' -DestinationPath '" + tool_dir.string() + "' -Force\"";
+        extracted = meccha_run_hidden_process(ps_command, tool_dir, exit_code) && exit_code == 0;
+    }
+
+    if (!extracted || !std::filesystem::is_regular_file(steamcmd_exe, ec) || ec) {
+        error = "SteamCMD was downloaded but could not be extracted.";
+        return false;
+    }
+
+    std::filesystem::remove(zip_path, ec);
+    return true;
+}
+
+static bool meccha_copy_workshop_to_cache(AppId_t appid, PublishedFileId_t id, const std::filesystem::path &tool_dir, std::string &error)
+{
+    const std::string id_text = std::to_string(static_cast<unsigned long long>(id));
+    const auto source = tool_dir / "steamapps" / "workshop" / "content" / std::to_string(appid) / id_text;
+
+    if (!meccha_directory_has_files(source)) {
+        error = "SteamCMD finished, but the Workshop item was not downloaded. It may require an authenticated Steam account.";
+        return false;
+    }
+
+    const auto cache_root = meccha_settings_path() / MECCHA_WORKSHOP_CACHE_DIR;
+    const auto target = cache_root / id_text;
+    const auto staging = cache_root / (id_text + ".partial");
+
+    std::error_code ec;
+    std::filesystem::create_directories(cache_root, ec);
+    if (ec) {
+        error = "Could not create the Workshop cache directory.";
+        return false;
+    }
+
+    std::filesystem::remove_all(staging, ec);
+    ec.clear();
+    std::filesystem::copy(
+        source,
+        staging,
+        std::filesystem::copy_options::recursive | std::filesystem::copy_options::overwrite_existing,
+        ec
+    );
+    if (ec || !meccha_directory_has_files(staging)) {
+        std::filesystem::remove_all(staging, ec);
+        error = "Could not copy the downloaded Workshop item into Goldberg's live cache.";
+        return false;
+    }
+
+    std::filesystem::remove_all(target, ec);
+    ec.clear();
+    std::filesystem::rename(staging, target, ec);
+    if (ec) {
+        std::filesystem::remove_all(staging, ec);
+        error = "Could not activate the downloaded Workshop item.";
+        return false;
+    }
+
+    return true;
+}
+
+static void meccha_set_download_status(PublishedFileId_t id, MecchaWorkshopDownloadStatus status, std::string error = {})
+{
+    std::lock_guard<std::mutex> lock(meccha_download_mutex);
+    auto &record = meccha_downloads[id];
+    record.status = status;
+    record.error = std::move(error);
+}
+
+static MecchaWorkshopDownloadStatus meccha_get_download_status(PublishedFileId_t id, std::string *error = nullptr)
+{
+    std::lock_guard<std::mutex> lock(meccha_download_mutex);
+    const auto it = meccha_downloads.find(id);
+    if (it == meccha_downloads.end()) return MecchaWorkshopDownloadStatus::none;
+    if (error) *error = it->second.error;
+    return it->second.status;
+}
+
+static void meccha_start_workshop_download(PublishedFileId_t id, AppId_t appid)
+{
+    if (!id || id == k_PublishedFileIdInvalid || meccha_is_workshop_installed(id)) return;
+
+    {
+        std::lock_guard<std::mutex> lock(meccha_download_mutex);
+        auto &record = meccha_downloads[id];
+        if (record.status == MecchaWorkshopDownloadStatus::downloading) return;
+        record.status = MecchaWorkshopDownloadStatus::downloading;
+        record.error.clear();
+    }
+
+    std::thread([id, appid]() {
+        const std::string id_text = std::to_string(static_cast<unsigned long long>(id));
+        const auto tool_dir = meccha_settings_path() / "meccha_tools" / "steamcmd";
+        const auto steamcmd_exe = tool_dir / "steamcmd.exe";
+        std::string error;
+
+        PRINT_DEBUG("MECCHA workshop: starting automatic download item %llu app %u", id, appid);
+
+        if (!meccha_bootstrap_steamcmd(tool_dir, error)) {
+            meccha_set_download_status(id, MecchaWorkshopDownloadStatus::failed, error);
+            meccha_push_download_notice("Workshop " + id_text + " failed: " + error);
+            PRINT_DEBUG("MECCHA workshop: item %llu failed: %s", id, error.c_str());
+            return;
+        }
+
+        DWORD exit_code{};
+        const std::string command =
+            "\"" + steamcmd_exe.string() + "\" +login anonymous +workshop_download_item " +
+            std::to_string(appid) + " " + id_text + " validate +quit";
+
+        if (!meccha_run_hidden_process(command, tool_dir, exit_code)) {
+            error = "SteamCMD could not be started.";
+            meccha_set_download_status(id, MecchaWorkshopDownloadStatus::failed, error);
+            meccha_push_download_notice("Workshop " + id_text + " failed: " + error);
+            PRINT_DEBUG("MECCHA workshop: item %llu failed to start SteamCMD", id);
+            return;
+        }
+
+        PRINT_DEBUG("MECCHA workshop: SteamCMD exit code %lu for item %llu", exit_code, id);
+
+        if (!meccha_copy_workshop_to_cache(appid, id, tool_dir, error)) {
+            meccha_set_download_status(id, MecchaWorkshopDownloadStatus::failed, error);
+            meccha_push_download_notice("Workshop " + id_text + " failed: " + error);
+            PRINT_DEBUG("MECCHA workshop: item %llu failed: %s", id, error.c_str());
+            return;
+        }
+
+        std::error_code ec;
+        const auto request_file = meccha_settings_path() / MECCHA_WORKSHOP_REQUEST_DIR / (id_text + ".request");
+        std::filesystem::remove(request_file, ec);
+
+        meccha_set_download_status(id, MecchaWorkshopDownloadStatus::installed);
+        meccha_push_completed_download(id);
+        meccha_push_download_notice("Workshop " + id_text + " installed successfully. MECCHA can now load the map.");
+        PRINT_DEBUG("MECCHA workshop: item %llu installed into live cache", id);
+    }).detach();
+}
+
+#endif
+
 static void meccha_queue_workshop_request(PublishedFileId_t id, const char *reason, AppId_t appid)
 {
     if (!id || id == k_PublishedFileIdInvalid || meccha_is_workshop_installed(id)) return;
@@ -418,6 +697,9 @@ static void meccha_queue_workshop_request(PublishedFileId_t id, const char *reas
     out << "appid=" << appid << "\n";
 
     PRINT_DEBUG("MECCHA workshop request queued item %llu reason='%s'", id, reason ? reason : "unknown");
+#ifdef _WIN32
+    meccha_start_workshop_download(id, appid);
+#endif
 }
 
 static void meccha_begin_workshop_consent(uint64 lobby_id, PublishedFileId_t id, const char *reason, AppId_t appid)
@@ -1950,6 +2232,31 @@ void Steam_Matchmaking::RunCallbacks()
             }
         }
     }
+    PublishedFileId_t meccha_completed_id{};
+    while (meccha_take_completed_download(meccha_completed_id)) {
+        DownloadItemResult_t download_result{};
+        download_result.m_eResult = EResult::k_EResultOK;
+        download_result.m_nPublishedFileId = meccha_completed_id;
+        download_result.m_unAppID = settings->get_local_game_id().AppID();
+        callbacks->addCBResult(download_result.k_iCallback, &download_result, sizeof(download_result), 0.050);
+
+        ItemInstalled_t installed{};
+        installed.m_hLegacyContent = meccha_completed_id;
+        installed.m_nPublishedFileId = meccha_completed_id;
+        installed.m_unAppID = settings->get_local_game_id().AppID();
+        installed.m_unManifestID = 1;
+        callbacks->addCBResult(installed.k_iCallback, &installed, sizeof(installed), 0.100);
+
+        PRINT_DEBUG("MECCHA workshop: emitted Steam UGC installed callbacks for item %llu", meccha_completed_id);
+    }
+
+    std::string meccha_download_notice;
+    while (meccha_take_download_notice(meccha_download_notice)) {
+        const std::string notice = meccha_download_notice;
+        std::thread([notice]() {
+            MessageBoxA(nullptr, notice.c_str(), "MECCHA Workshop", MB_OK | MB_ICONINFORMATION | MB_TOPMOST);
+        }).detach();
+    }
 #endif
 
     run_background();
@@ -2080,6 +2387,24 @@ void Steam_Matchmaking::RunCallbacks()
                     g->joined = std::chrono::high_resolution_clock::now();
                     meccha_pending_workshop.erase(workshop_state);
                 } else {
+#ifdef _WIN32
+                    std::string download_error;
+                    if (meccha_get_download_status(workshop_state->second.workshop_id, &download_error) == MecchaWorkshopDownloadStatus::failed) {
+                        PRINT_DEBUG("MECCHA workshop: item %llu download failed, cancelling lobby join: %s",
+                            workshop_state->second.workshop_id, download_error.c_str());
+
+                        LobbyEnter_t data{};
+                        data.m_ulSteamIDLobby = meccha_lobby_id;
+                        data.m_rgfChatPermissions = 0;
+                        data.m_bLocked = false;
+                        data.m_EChatRoomEnterResponse = k_EChatRoomEnterResponseNotAllowed;
+                        callback_results->addCallResult(g->api_id, data.k_iCallback, &data, sizeof(data));
+                        callbacks->addCBResult(data.k_iCallback, &data, sizeof(data));
+                        meccha_pending_workshop.erase(workshop_state);
+                        g = pending_joins.erase(g);
+                        continue;
+                    }
+#endif
                     ++g;
                     continue;
                 }
