@@ -3,25 +3,30 @@
 #ifdef _WIN32
 
 #include <windows.h>
+#include <objidl.h>
 #include <gdiplus.h>
 #include <filesystem>
 #include <string>
 
+#include "meccha_dialog_gif_data.h"
+
 #ifdef _MSC_VER
 #pragma comment(lib, "Gdiplus.lib")
+#pragma comment(lib, "Ole32.lib")
 #endif
 
 namespace MecchaWorkshopUI {
 
-// MECCHA v11.2: render the Workshop artwork through a real child STATIC
-// bitmap control instead of drawing directly in the parent WM_PAINT handler.
-// This is much more reliable with Unreal's foreground/window repaint behavior.
+// MECCHA v11.3
+// The dialog GIF is compiled directly into steam_api64.dll.
+// No external meccha_dialog.gif or meccha_dialog.png is required.
 
 struct DownloadConsentState {
     unsigned long long workshop_id{};
     int result{IDNO};
     bool done{};
     Gdiplus::Image *image{};
+    IStream *image_stream{};
     HWND image_control{};
     HBITMAP bitmap{};
     UINT frame{};
@@ -71,8 +76,8 @@ inline HBITMAP make_scaled_bitmap(
     if (draw_h < 1) draw_h = 1;
 
     Gdiplus::Bitmap scaled(
-        draw_w,
-        draw_h,
+        box_w,
+        box_h,
         PixelFormat32bppARGB
     );
 
@@ -90,10 +95,16 @@ inline HBITMAP make_scaled_bitmap(
         Gdiplus::Color(240, 240, 240)
     );
 
+    const int draw_x =
+        (box_w - draw_w) / 2;
+
+    const int draw_y =
+        (box_h - draw_h) / 2;
+
     graphics.DrawImage(
         image,
-        0,
-        0,
+        draw_x,
+        draw_y,
         draw_w,
         draw_h
     );
@@ -159,6 +170,78 @@ inline void refresh_image_bitmap(
     UpdateWindow(
         state->image_control
     );
+}
+
+inline bool load_embedded_gif(
+    DownloadConsentState &state
+)
+{
+    if (state.image) {
+        return true;
+    }
+
+    if (!MecchaEmbeddedDialogGif::size) {
+        return false;
+    }
+
+    HGLOBAL memory =
+        GlobalAlloc(
+            GMEM_MOVEABLE,
+            MecchaEmbeddedDialogGif::size
+        );
+
+    if (!memory) {
+        return false;
+    }
+
+    void *locked =
+        GlobalLock(memory);
+
+    if (!locked) {
+        GlobalFree(memory);
+        return false;
+    }
+
+    memcpy(
+        locked,
+        MecchaEmbeddedDialogGif::data,
+        MecchaEmbeddedDialogGif::size
+    );
+
+    GlobalUnlock(memory);
+
+    IStream *stream{};
+
+    const HRESULT hr =
+        CreateStreamOnHGlobal(
+            memory,
+            TRUE,
+            &stream
+        );
+
+    if (FAILED(hr) || !stream) {
+        GlobalFree(memory);
+        return false;
+    }
+
+    auto *image =
+        new Gdiplus::Image(
+            stream,
+            FALSE
+        );
+
+    if (!image ||
+        image->GetLastStatus() !=
+            Gdiplus::Ok) {
+
+        delete image;
+        stream->Release();
+        return false;
+    }
+
+    state.image = image;
+    state.image_stream = stream;
+    return true;
 }
 
 inline LRESULT CALLBACK download_consent_proc(
@@ -442,46 +525,13 @@ inline LRESULT CALLBACK download_consent_proc(
     );
 }
 
-inline bool try_load_image(
-    DownloadConsentState &state,
-    const std::filesystem::path &candidate
-)
-{
-    if (state.image) {
-        return true;
-    }
-
-    std::error_code ec;
-
-    if (!std::filesystem::is_regular_file(
-            candidate,
-            ec
-        ) || ec) {
-        return false;
-    }
-
-    auto *image =
-        new Gdiplus::Image(
-            candidate.wstring().c_str()
-        );
-
-    if (!image ||
-        image->GetLastStatus() !=
-            Gdiplus::Ok) {
-
-        delete image;
-        return false;
-    }
-
-    state.image = image;
-    return true;
-}
-
 inline int show_download_consent(
     unsigned long long workshop_id,
     const std::filesystem::path &requested_path
 )
 {
+    (void)requested_path;
+
     Gdiplus::GdiplusStartupInput
         startup_input;
 
@@ -500,92 +550,14 @@ inline int show_download_consent(
 
     if (gdiplus_status ==
         Gdiplus::Ok) {
-
-        try_load_image(
-            state,
-            requested_path
-        );
-
-        auto requested_png =
-            requested_path;
-
-        requested_png.replace_extension(
-            ".png"
-        );
-
-        try_load_image(
-            state,
-            requested_png
-        );
-
-        wchar_t module_file[MAX_PATH]{};
-
-        HMODULE steam_module =
-            GetModuleHandleW(
-                L"steam_api64.dll"
-            );
-
-        if (steam_module &&
-            GetModuleFileNameW(
-                steam_module,
-                module_file,
-                MAX_PATH
-            )) {
-
-            const auto module_dir =
-                std::filesystem::path(
-                    module_file
-                ).parent_path();
-
-            try_load_image(
-                state,
-                module_dir /
-                "steam_settings" /
-                "meccha_dialog.gif"
-            );
-
-            try_load_image(
-                state,
-                module_dir /
-                "steam_settings" /
-                "meccha_dialog.png"
-            );
-        }
-
-        module_file[0] = L'\0';
-
-        if (GetModuleFileNameW(
-                nullptr,
-                module_file,
-                MAX_PATH
-            )) {
-
-            const auto exe_dir =
-                std::filesystem::path(
-                    module_file
-                ).parent_path();
-
-            try_load_image(
-                state,
-                exe_dir /
-                "steam_settings" /
-                "meccha_dialog.gif"
-            );
-
-            try_load_image(
-                state,
-                exe_dir /
-                "steam_settings" /
-                "meccha_dialog.png"
-            );
-        }
+        load_embedded_gif(state);
     }
 
     HINSTANCE instance =
         GetModuleHandleA(nullptr);
 
     const char class_name[] =
-        "GBE_MECCHA_DOWNLOAD_CONSENT_V112";
+        "GBE_MECCHA_DOWNLOAD_CONSENT_V113";
 
     WNDCLASSEXA wc{};
     wc.cbSize = sizeof(wc);
@@ -653,6 +625,11 @@ inline int show_download_consent(
 
     if (!hwnd) {
         delete state.image;
+
+        if (state.image_stream) {
+            state.image_stream->Release();
+            state.image_stream = nullptr;
+        }
 
         if (gdiplus_token) {
             Gdiplus::GdiplusShutdown(
@@ -731,6 +708,11 @@ inline int show_download_consent(
 
     delete state.image;
     state.image = nullptr;
+
+    if (state.image_stream) {
+        state.image_stream->Release();
+        state.image_stream = nullptr;
+    }
 
     if (gdiplus_token) {
         Gdiplus::GdiplusShutdown(
