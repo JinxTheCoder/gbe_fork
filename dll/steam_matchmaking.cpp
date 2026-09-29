@@ -885,6 +885,66 @@ static void meccha_begin_workshop_consent(uint64 lobby_id, PublishedFileId_t id,
 #endif
 }
 
+#ifdef _WIN32
+static void meccha_process_external_workshop_requests(AppId_t fallback_appid)
+{
+    const auto request_dir =
+        meccha_settings_path() / MECCHA_WORKSHOP_REQUEST_DIR;
+
+    std::error_code ec;
+    if (!std::filesystem::is_directory(request_dir, ec) || ec) return;
+
+    for (const auto &entry :
+         std::filesystem::directory_iterator(
+             request_dir,
+             std::filesystem::directory_options::skip_permission_denied,
+             ec)) {
+
+        if (ec) break;
+
+        std::error_code entry_ec;
+        if (!entry.is_regular_file(entry_ec) || entry_ec) continue;
+        if (entry.path().extension() != ".request") continue;
+
+        PublishedFileId_t id{};
+        if (!meccha_parse_workshop_id(entry.path().stem().string(), id)) continue;
+
+        if (meccha_is_workshop_installed(id)) {
+            std::filesystem::remove(entry.path(), entry_ec);
+            continue;
+        }
+
+        if (meccha_get_download_status(id) ==
+            MecchaWorkshopDownloadStatus::downloading) {
+            continue;
+        }
+
+        AppId_t appid = fallback_appid;
+
+        std::ifstream request(entry.path(), std::ios::binary);
+        std::string line;
+        while (std::getline(request, line)) {
+            if (line.rfind("appid=", 0) != 0) continue;
+
+            try {
+                const unsigned long parsed = std::stoul(line.substr(6));
+                if (parsed) appid = static_cast<AppId_t>(parsed);
+            } catch (...) {
+            }
+        }
+
+        PRINT_DEBUG(
+            "MECCHA workshop: processing external DownloadItem request %llu app %u",
+            id,
+            appid
+        );
+
+        meccha_start_workshop_download(id, appid);
+        std::filesystem::remove(entry.path(), entry_ec);
+    }
+}
+#endif
+
 } // namespace
 
 
@@ -2327,6 +2387,7 @@ void Steam_Matchmaking::run_background()
 void Steam_Matchmaking::RunCallbacks()
 {
 #ifdef _WIN32
+    meccha_process_external_workshop_requests(settings->get_local_game_id().AppID());
     const bool f8_down = (GetAsyncKeyState(VK_F8) & 0x8000) != 0;
     if (f8_down && !meccha_f8_was_down) {
         const std::string initial = meccha_required_workshop_id.empty()

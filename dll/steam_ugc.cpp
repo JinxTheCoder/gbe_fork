@@ -2074,40 +2074,84 @@ bool Steam_UGC::GetItemInstallInfo( PublishedFileId_t nPublishedFileID, uint64 *
 // If bHighPriority is set, any other item download will be suspended and this item downloaded ASAP.
 bool Steam_UGC::DownloadItem( PublishedFileId_t nPublishedFileID, bool bHighPriority )
 {
-    PRINT_DEBUG("%llu %i // TODO", nPublishedFileID, (int)bHighPriority);
+    PRINT_DEBUG("%llu %i", nPublishedFileID, (int)bHighPriority);
     std::lock_guard<std::recursive_mutex> lock(global_mutex);
     refresh_live_workshop_cache(settings, ugc_bridge);
-    
-    if (!settings->isModInstalled(nPublishedFileID)) {
-        DownloadItemResult_t data_fail{};
-        data_fail.m_eResult = EResult::k_EResultFail;
-        data_fail.m_nPublishedFileId = nPublishedFileID;
-        data_fail.m_unAppID = settings->get_local_game_id().AppID();
-        callbacks->addCBResult(data_fail.k_iCallback, &data_fail, sizeof(data_fail), 0.050);
+
+    if (!nPublishedFileID || nPublishedFileID == k_PublishedFileIdInvalid) {
         return false;
     }
 
-    {
-        DownloadItemResult_t data{};
-        data.m_eResult = EResult::k_EResultOK;
-        data.m_nPublishedFileId = nPublishedFileID;
-        data.m_unAppID = settings->get_local_game_id().AppID();
-        callbacks->addCBResult(data.k_iCallback, &data, sizeof(data), 0.1);
+    if (!settings->isModInstalled(nPublishedFileID)) {
+#ifdef _WIN32
+        // MECCHA native Download Mod consent
+        const std::string id_text =
+            std::to_string(static_cast<unsigned long long>(nPublishedFileID));
+
+        const std::string prompt =
+            "MECCHA wants to download the missing Steam Workshop map:\n\n"
+            "Workshop ID: " + id_text +
+            "\n\nDownload and install this map now?";
+
+        const int response = MessageBoxA(
+            nullptr,
+            prompt.c_str(),
+            "MECCHA Workshop - Download Mod",
+            MB_YESNO | MB_ICONQUESTION | MB_SETFOREGROUND | MB_TOPMOST
+        );
+
+        if (response != IDYES) {
+            PRINT_DEBUG(
+                "MECCHA workshop: native DownloadItem permission denied for item %llu",
+                nPublishedFileID
+            );
+            return false;
+        }
+
+        const auto request_dir =
+            std::filesystem::u8path(Local_Storage::get_game_settings_path()) /
+            "workshop_requests";
+
+        std::error_code ec;
+        std::filesystem::create_directories(request_dir, ec);
+        if (ec) return false;
+
+        const auto request_file = request_dir / (id_text + ".request");
+
+        std::ofstream out(request_file, std::ios::binary | std::ios::trunc);
+        if (!out) return false;
+
+        out << "workshop_id=" << static_cast<unsigned long long>(nPublishedFileID) << "\n";
+        out << "reason=native_download_mod_button\n";
+        out << "appid=" << settings->get_local_game_id().AppID() << "\n";
+        out.close();
+
+        PRINT_DEBUG(
+            "MECCHA workshop: native DownloadItem queued item %llu after permission",
+            nPublishedFileID
+        );
+
+        return true;
+#else
+        return false;
+#endif
     }
 
-    {
-        ItemInstalled_t data{};
-        data.m_hLegacyContent = nPublishedFileID;
-        data.m_nPublishedFileId = nPublishedFileID;
-        data.m_unAppID = settings->get_local_game_id().AppID();
-        data.m_unManifestID = 123; // TODO
-        callbacks->addCBResult(data.k_iCallback, &data, sizeof(data), 0.15);
-    }
+    DownloadItemResult_t data{};
+    data.m_eResult = EResult::k_EResultOK;
+    data.m_nPublishedFileId = nPublishedFileID;
+    data.m_unAppID = settings->get_local_game_id().AppID();
+    callbacks->addCBResult(data.k_iCallback, &data, sizeof(data), 0.1);
 
-    PRINT_DEBUG("downloaded!");
+    ItemInstalled_t installed{};
+    installed.m_hLegacyContent = nPublishedFileID;
+    installed.m_nPublishedFileId = nPublishedFileID;
+    installed.m_unAppID = settings->get_local_game_id().AppID();
+    installed.m_unManifestID = 123;
+    callbacks->addCBResult(installed.k_iCallback, &installed, sizeof(installed), 0.15);
+
     return true;
 }
-
 
 // game servers can set a specific workshop folder before issuing any UGC commands.
 // This is helpful if you want to support multiple game servers running out of the same install folder
