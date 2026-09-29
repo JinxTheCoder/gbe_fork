@@ -13,16 +13,153 @@
 
 namespace MecchaWorkshopUI {
 
+// MECCHA v11.2: render the Workshop artwork through a real child STATIC
+// bitmap control instead of drawing directly in the parent WM_PAINT handler.
+// This is much more reliable with Unreal's foreground/window repaint behavior.
+
 struct DownloadConsentState {
     unsigned long long workshop_id{};
     int result{IDNO};
     bool done{};
-    Gdiplus::Image *gif{};
+    Gdiplus::Image *image{};
+    HWND image_control{};
+    HBITMAP bitmap{};
     UINT frame{};
     UINT frame_count{};
 };
 
 constexpr UINT_PTR GIF_TIMER_ID = 0x4D43;
+
+inline HBITMAP make_scaled_bitmap(
+    Gdiplus::Image *image,
+    int box_w,
+    int box_h
+)
+{
+    if (!image ||
+        image->GetLastStatus() != Gdiplus::Ok) {
+        return nullptr;
+    }
+
+    const UINT source_w = image->GetWidth();
+    const UINT source_h = image->GetHeight();
+
+    if (!source_w || !source_h) {
+        return nullptr;
+    }
+
+    const double scale_x =
+        static_cast<double>(box_w) /
+        static_cast<double>(source_w);
+
+    const double scale_y =
+        static_cast<double>(box_h) /
+        static_cast<double>(source_h);
+
+    const double scale =
+        scale_x < scale_y
+            ? scale_x
+            : scale_y;
+
+    int draw_w =
+        static_cast<int>(source_w * scale);
+
+    int draw_h =
+        static_cast<int>(source_h * scale);
+
+    if (draw_w < 1) draw_w = 1;
+    if (draw_h < 1) draw_h = 1;
+
+    Gdiplus::Bitmap scaled(
+        draw_w,
+        draw_h,
+        PixelFormat32bppARGB
+    );
+
+    Gdiplus::Graphics graphics(&scaled);
+
+    graphics.SetInterpolationMode(
+        Gdiplus::InterpolationModeHighQualityBicubic
+    );
+
+    graphics.SetPixelOffsetMode(
+        Gdiplus::PixelOffsetModeHighQuality
+    );
+
+    graphics.Clear(
+        Gdiplus::Color(240, 240, 240)
+    );
+
+    graphics.DrawImage(
+        image,
+        0,
+        0,
+        draw_w,
+        draw_h
+    );
+
+    HBITMAP bitmap{};
+
+    if (scaled.GetHBITMAP(
+            Gdiplus::Color(240, 240, 240),
+            &bitmap
+        ) != Gdiplus::Ok) {
+        return nullptr;
+    }
+
+    return bitmap;
+}
+
+inline void refresh_image_bitmap(
+    DownloadConsentState *state
+)
+{
+    if (!state ||
+        !state->image_control ||
+        !state->image) {
+        return;
+    }
+
+    HBITMAP new_bitmap =
+        make_scaled_bitmap(
+            state->image,
+            180,
+            142
+        );
+
+    if (!new_bitmap) {
+        return;
+    }
+
+    HBITMAP old_bitmap =
+        reinterpret_cast<HBITMAP>(
+            SendMessageA(
+                state->image_control,
+                STM_SETIMAGE,
+                IMAGE_BITMAP,
+                reinterpret_cast<LPARAM>(
+                    new_bitmap
+                )
+            )
+        );
+
+    if (old_bitmap &&
+        old_bitmap != new_bitmap) {
+        DeleteObject(old_bitmap);
+    }
+
+    state->bitmap = new_bitmap;
+
+    InvalidateRect(
+        state->image_control,
+        nullptr,
+        TRUE
+    );
+
+    UpdateWindow(
+        state->image_control
+    );
+}
 
 inline LRESULT CALLBACK download_consent_proc(
     HWND hwnd,
@@ -31,119 +168,84 @@ inline LRESULT CALLBACK download_consent_proc(
     LPARAM lparam
 )
 {
-    auto *state = reinterpret_cast<DownloadConsentState *>(
-        GetWindowLongPtrA(hwnd, GWLP_USERDATA)
-    );
+    auto *state =
+        reinterpret_cast<DownloadConsentState *>(
+            GetWindowLongPtrA(
+                hwnd,
+                GWLP_USERDATA
+            )
+        );
 
     switch (msg) {
         case WM_NCCREATE: {
-            auto *create = reinterpret_cast<CREATESTRUCTA *>(lparam);
+            auto *create =
+                reinterpret_cast<CREATESTRUCTA *>(
+                    lparam
+                );
+
             SetWindowLongPtrA(
                 hwnd,
                 GWLP_USERDATA,
-                reinterpret_cast<LONG_PTR>(create->lpCreateParams)
+                reinterpret_cast<LONG_PTR>(
+                    create->lpCreateParams
+                )
             );
+
             return TRUE;
         }
 
         case WM_CREATE: {
-            state = reinterpret_cast<DownloadConsentState *>(
-                GetWindowLongPtrA(hwnd, GWLP_USERDATA)
-            );
+            state =
+                reinterpret_cast<DownloadConsentState *>(
+                    GetWindowLongPtrA(
+                        hwnd,
+                        GWLP_USERDATA
+                    )
+                );
 
-            HFONT font = reinterpret_cast<HFONT>(
-                GetStockObject(DEFAULT_GUI_FONT)
-            );
+            HFONT font =
+                reinterpret_cast<HFONT>(
+                    GetStockObject(
+                        DEFAULT_GUI_FONT
+                    )
+                );
 
-            const bool has_gif =
+            const bool has_image =
                 state &&
-                state->gif &&
-                state->gif->GetLastStatus() == Gdiplus::Ok;
+                state->image &&
+                state->image->GetLastStatus() ==
+                    Gdiplus::Ok;
 
-            const int text_x = has_gif ? 218 : 24;
-            const int text_width = has_gif ? 330 : 520;
+            const int text_x =
+                has_image ? 218 : 24;
 
-            const std::string id_text =
-                std::to_string(state->workshop_id);
+            const int text_width =
+                has_image ? 330 : 520;
 
-            const std::string text =
-                "MECCHA wants to download the missing Steam Workshop map.\r\n\r\n"
-                "Workshop ID: " + id_text +
-                "\r\n\r\nDownload and install this map now?";
+            if (has_image) {
+                state->image_control =
+                    CreateWindowExA(
+                        WS_EX_CLIENTEDGE,
+                        "STATIC",
+                        "",
+                        WS_CHILD |
+                        WS_VISIBLE |
+                        SS_BITMAP |
+                        SS_CENTERIMAGE,
+                        18,
+                        18,
+                        180,
+                        142,
+                        hwnd,
+                        nullptr,
+                        GetModuleHandleA(nullptr),
+                        nullptr
+                    );
 
-            HWND label = CreateWindowExA(
-                0,
-                "STATIC",
-                text.c_str(),
-                WS_CHILD | WS_VISIBLE | SS_LEFT,
-                text_x,
-                30,
-                text_width,
-                125,
-                hwnd,
-                nullptr,
-                GetModuleHandleA(nullptr),
-                nullptr
-            );
+                refresh_image_bitmap(state);
 
-            HWND yes_btn = CreateWindowExA(
-                0,
-                "BUTTON",
-                "Download",
-                WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON,
-                338,
-                180,
-                100,
-                32,
-                hwnd,
-                reinterpret_cast<HMENU>(
-                    static_cast<INT_PTR>(IDYES)
-                ),
-                GetModuleHandleA(nullptr),
-                nullptr
-            );
-
-            HWND no_btn = CreateWindowExA(
-                0,
-                "BUTTON",
-                "No",
-                WS_CHILD | WS_VISIBLE | WS_TABSTOP,
-                448,
-                180,
-                100,
-                32,
-                hwnd,
-                reinterpret_cast<HMENU>(
-                    static_cast<INT_PTR>(IDNO)
-                ),
-                GetModuleHandleA(nullptr),
-                nullptr
-            );
-
-            SendMessageA(
-                label,
-                WM_SETFONT,
-                reinterpret_cast<WPARAM>(font),
-                TRUE
-            );
-
-            SendMessageA(
-                yes_btn,
-                WM_SETFONT,
-                reinterpret_cast<WPARAM>(font),
-                TRUE
-            );
-
-            SendMessageA(
-                no_btn,
-                WM_SETFONT,
-                reinterpret_cast<WPARAM>(font),
-                TRUE
-            );
-
-            if (has_gif) {
                 state->frame_count =
-                    state->gif->GetFrameCount(
+                    state->image->GetFrameCount(
                         &Gdiplus::FrameDimensionTime
                     );
 
@@ -157,6 +259,106 @@ inline LRESULT CALLBACK download_consent_proc(
                 }
             }
 
+            const std::string id_text =
+                std::to_string(
+                    state->workshop_id
+                );
+
+            const std::string text =
+                "MECCHA wants to download the missing Steam Workshop map.\r\n\r\n"
+                "Workshop ID: " + id_text +
+                "\r\n\r\nDownload and install this map now?";
+
+            HWND label =
+                CreateWindowExA(
+                    0,
+                    "STATIC",
+                    text.c_str(),
+                    WS_CHILD |
+                    WS_VISIBLE |
+                    SS_LEFT,
+                    text_x,
+                    30,
+                    text_width,
+                    125,
+                    hwnd,
+                    nullptr,
+                    GetModuleHandleA(nullptr),
+                    nullptr
+                );
+
+            HWND yes_btn =
+                CreateWindowExA(
+                    0,
+                    "BUTTON",
+                    "Download",
+                    WS_CHILD |
+                    WS_VISIBLE |
+                    WS_TABSTOP |
+                    BS_DEFPUSHBUTTON,
+                    338,
+                    180,
+                    100,
+                    32,
+                    hwnd,
+                    reinterpret_cast<HMENU>(
+                        static_cast<INT_PTR>(
+                            IDYES
+                        )
+                    ),
+                    GetModuleHandleA(nullptr),
+                    nullptr
+                );
+
+            HWND no_btn =
+                CreateWindowExA(
+                    0,
+                    "BUTTON",
+                    "No",
+                    WS_CHILD |
+                    WS_VISIBLE |
+                    WS_TABSTOP,
+                    448,
+                    180,
+                    100,
+                    32,
+                    hwnd,
+                    reinterpret_cast<HMENU>(
+                        static_cast<INT_PTR>(
+                            IDNO
+                        )
+                    ),
+                    GetModuleHandleA(nullptr),
+                    nullptr
+                );
+
+            SendMessageA(
+                label,
+                WM_SETFONT,
+                reinterpret_cast<WPARAM>(
+                    font
+                ),
+                TRUE
+            );
+
+            SendMessageA(
+                yes_btn,
+                WM_SETFONT,
+                reinterpret_cast<WPARAM>(
+                    font
+                ),
+                TRUE
+            );
+
+            SendMessageA(
+                no_btn,
+                WM_SETFONT,
+                reinterpret_cast<WPARAM>(
+                    font
+                ),
+                TRUE
+            );
+
             SetFocus(yes_btn);
             return 0;
         }
@@ -164,89 +366,21 @@ inline LRESULT CALLBACK download_consent_proc(
         case WM_TIMER: {
             if (state &&
                 wparam == GIF_TIMER_ID &&
-                state->gif &&
+                state->image &&
                 state->frame_count > 1) {
 
                 state->frame =
                     (state->frame + 1) %
                     state->frame_count;
 
-                state->gif->SelectActiveFrame(
+                state->image->SelectActiveFrame(
                     &Gdiplus::FrameDimensionTime,
                     state->frame
                 );
 
-                RECT gif_rect{18, 18, 202, 164};
-                InvalidateRect(
-                    hwnd,
-                    &gif_rect,
-                    FALSE
-                );
+                refresh_image_bitmap(state);
             }
 
-            return 0;
-        }
-
-        case WM_PAINT: {
-            PAINTSTRUCT ps{};
-            HDC hdc = BeginPaint(hwnd, &ps);
-
-            if (state &&
-                state->gif &&
-                state->gif->GetLastStatus() == Gdiplus::Ok) {
-
-                Gdiplus::Graphics graphics(hdc);
-
-                const UINT source_w =
-                    state->gif->GetWidth();
-
-                const UINT source_h =
-                    state->gif->GetHeight();
-
-                if (source_w && source_h) {
-                    const int box_w = 180;
-                    const int box_h = 142;
-
-                    const double scale_x =
-                        static_cast<double>(box_w) /
-                        static_cast<double>(source_w);
-
-                    const double scale_y =
-                        static_cast<double>(box_h) /
-                        static_cast<double>(source_h);
-
-                    const double scale =
-                        scale_x < scale_y
-                            ? scale_x
-                            : scale_y;
-
-                    const int draw_w =
-                        static_cast<int>(
-                            source_w * scale
-                        );
-
-                    const int draw_h =
-                        static_cast<int>(
-                            source_h * scale
-                        );
-
-                    const int draw_x =
-                        18 + (box_w - draw_w) / 2;
-
-                    const int draw_y =
-                        18 + (box_h - draw_h) / 2;
-
-                    graphics.DrawImage(
-                        state->gif,
-                        draw_x,
-                        draw_y,
-                        draw_w,
-                        draw_h
-                    );
-                }
-            }
-
-            EndPaint(hwnd, &ps);
             return 0;
         }
 
@@ -272,13 +406,31 @@ inline LRESULT CALLBACK download_consent_proc(
         }
 
         case WM_CLOSE:
-            if (state) state->result = IDNO;
+            if (state) {
+                state->result = IDNO;
+            }
+
             DestroyWindow(hwnd);
             return 0;
 
         case WM_DESTROY:
-            KillTimer(hwnd, GIF_TIMER_ID);
-            if (state) state->done = true;
+            KillTimer(
+                hwnd,
+                GIF_TIMER_ID
+            );
+
+            if (state) {
+                if (state->bitmap) {
+                    DeleteObject(
+                        state->bitmap
+                    );
+
+                    state->bitmap = nullptr;
+                }
+
+                state->done = true;
+            }
+
             return 0;
     }
 
@@ -290,64 +442,88 @@ inline LRESULT CALLBACK download_consent_proc(
     );
 }
 
-inline int show_download_consent(
-    unsigned long long workshop_id,
-    const std::filesystem::path &gif_path
+inline bool try_load_image(
+    DownloadConsentState &state,
+    const std::filesystem::path &candidate
 )
 {
-    Gdiplus::GdiplusStartupInput startup_input;
+    if (state.image) {
+        return true;
+    }
+
+    std::error_code ec;
+
+    if (!std::filesystem::is_regular_file(
+            candidate,
+            ec
+        ) || ec) {
+        return false;
+    }
+
+    auto *image =
+        new Gdiplus::Image(
+            candidate.wstring().c_str()
+        );
+
+    if (!image ||
+        image->GetLastStatus() !=
+            Gdiplus::Ok) {
+
+        delete image;
+        return false;
+    }
+
+    state.image = image;
+    return true;
+}
+
+inline int show_download_consent(
+    unsigned long long workshop_id,
+    const std::filesystem::path &requested_path
+)
+{
+    Gdiplus::GdiplusStartupInput
+        startup_input;
+
     ULONG_PTR gdiplus_token{};
 
-    const Gdiplus::Status gdiplus_status =
-        Gdiplus::GdiplusStartup(
-            &gdiplus_token,
-            &startup_input,
-            nullptr
-        );
+    const Gdiplus::Status
+        gdiplus_status =
+            Gdiplus::GdiplusStartup(
+                &gdiplus_token,
+                &startup_input,
+                nullptr
+            );
 
     DownloadConsentState state{};
     state.workshop_id = workshop_id;
 
-    // MECCHA v11.1 robust dialog image loader
-    // Try the supplied path, PNG fallback, the steam_api64.dll folder,
-    // and finally the game EXE folder.
-    auto try_load_image =
-        [&](const std::filesystem::path &candidate) -> bool {
+    if (gdiplus_status ==
+        Gdiplus::Ok) {
 
-            if (state.gif) return true;
+        try_load_image(
+            state,
+            requested_path
+        );
 
-            std::error_code ec;
-            if (!std::filesystem::is_regular_file(candidate, ec) || ec) {
-                return false;
-            }
+        auto requested_png =
+            requested_path;
 
-            auto *image =
-                new Gdiplus::Image(
-                    candidate.wstring().c_str()
-                );
+        requested_png.replace_extension(
+            ".png"
+        );
 
-            if (!image ||
-                image->GetLastStatus() != Gdiplus::Ok) {
-
-                delete image;
-                return false;
-            }
-
-            state.gif = image;
-            return true;
-        };
-
-    if (gdiplus_status == Gdiplus::Ok) {
-        try_load_image(gif_path);
-
-        std::filesystem::path supplied_png = gif_path;
-        supplied_png.replace_extension(".png");
-        try_load_image(supplied_png);
+        try_load_image(
+            state,
+            requested_png
+        );
 
         wchar_t module_file[MAX_PATH]{};
 
         HMODULE steam_module =
-            GetModuleHandleW(L"steam_api64.dll");
+            GetModuleHandleW(
+                L"steam_api64.dll"
+            );
 
         if (steam_module &&
             GetModuleFileNameW(
@@ -357,16 +533,19 @@ inline int show_download_consent(
             )) {
 
             const auto module_dir =
-                std::filesystem::path(module_file)
-                    .parent_path();
+                std::filesystem::path(
+                    module_file
+                ).parent_path();
 
             try_load_image(
+                state,
                 module_dir /
                 "steam_settings" /
                 "meccha_dialog.gif"
             );
 
             try_load_image(
+                state,
                 module_dir /
                 "steam_settings" /
                 "meccha_dialog.png"
@@ -382,27 +561,31 @@ inline int show_download_consent(
             )) {
 
             const auto exe_dir =
-                std::filesystem::path(module_file)
-                    .parent_path();
+                std::filesystem::path(
+                    module_file
+                ).parent_path();
 
             try_load_image(
+                state,
                 exe_dir /
                 "steam_settings" /
                 "meccha_dialog.gif"
             );
 
             try_load_image(
+                state,
                 exe_dir /
                 "steam_settings" /
                 "meccha_dialog.png"
             );
         }
     }
+
     HINSTANCE instance =
         GetModuleHandleA(nullptr);
 
     const char class_name[] =
-        "GBE_MECCHA_DOWNLOAD_CONSENT_V11";
+        "GBE_MECCHA_DOWNLOAD_CONSENT_V112";
 
     WNDCLASSEXA wc{};
     wc.cbSize = sizeof(wc);
@@ -410,12 +593,16 @@ inline int show_download_consent(
         download_consent_proc;
     wc.hInstance = instance;
     wc.hCursor =
-        LoadCursor(nullptr, IDC_ARROW);
+        LoadCursor(
+            nullptr,
+            IDC_ARROW
+        );
     wc.hbrBackground =
         reinterpret_cast<HBRUSH>(
             COLOR_BTNFACE + 1
         );
-    wc.lpszClassName = class_name;
+    wc.lpszClassName =
+        class_name;
 
     RegisterClassExA(&wc);
 
@@ -423,6 +610,7 @@ inline int show_download_consent(
     const int height = 265;
 
     RECT desktop{};
+
     SystemParametersInfoA(
         SPI_GETWORKAREA,
         0,
@@ -432,34 +620,39 @@ inline int show_download_consent(
 
     const int x =
         desktop.left +
-        ((desktop.right - desktop.left) -
+        ((desktop.right -
+          desktop.left) -
          width) / 2;
 
     const int y =
         desktop.top +
-        ((desktop.bottom - desktop.top) -
+        ((desktop.bottom -
+          desktop.top) -
          height) / 2;
 
-    HWND owner = GetForegroundWindow();
+    HWND owner =
+        GetForegroundWindow();
 
-    HWND hwnd = CreateWindowExA(
-        WS_EX_DLGMODALFRAME |
-        WS_EX_TOPMOST,
-        class_name,
-        "MECCHA Workshop - Download Mod",
-        WS_CAPTION | WS_SYSMENU,
-        x,
-        y,
-        width,
-        height,
-        owner,
-        nullptr,
-        instance,
-        &state
-    );
+    HWND hwnd =
+        CreateWindowExA(
+            WS_EX_DLGMODALFRAME |
+            WS_EX_TOPMOST,
+            class_name,
+            "MECCHA Workshop - Download Mod",
+            WS_CAPTION |
+            WS_SYSMENU,
+            x,
+            y,
+            width,
+            height,
+            owner,
+            nullptr,
+            instance,
+            &state
+        );
 
     if (!hwnd) {
-        delete state.gif;
+        delete state.image;
 
         if (gdiplus_token) {
             Gdiplus::GdiplusShutdown(
@@ -469,7 +662,9 @@ inline int show_download_consent(
 
         const std::string fallback =
             "MECCHA wants to download Steam Workshop item " +
-            std::to_string(workshop_id) +
+            std::to_string(
+                workshop_id
+            ) +
             ".\n\nDownload and install it now?";
 
         return MessageBoxA(
@@ -483,11 +678,19 @@ inline int show_download_consent(
         );
     }
 
-    if (owner && owner != hwnd) {
-        EnableWindow(owner, FALSE);
+    if (owner &&
+        owner != hwnd) {
+        EnableWindow(
+            owner,
+            FALSE
+        );
     }
 
-    ShowWindow(hwnd, SW_SHOW);
+    ShowWindow(
+        hwnd,
+        SW_SHOW
+    );
+
     UpdateWindow(hwnd);
 
     MSG msg{};
@@ -501,21 +704,33 @@ inline int show_download_consent(
                 0
             );
 
-        if (result <= 0) break;
+        if (result <= 0) {
+            break;
+        }
 
-        if (!IsDialogMessageA(hwnd, &msg)) {
+        if (!IsDialogMessageA(
+                hwnd,
+                &msg
+            )) {
+
             TranslateMessage(&msg);
             DispatchMessageA(&msg);
         }
     }
 
-    if (owner && IsWindow(owner)) {
-        EnableWindow(owner, TRUE);
+    if (owner &&
+        IsWindow(owner)) {
+
+        EnableWindow(
+            owner,
+            TRUE
+        );
+
         SetForegroundWindow(owner);
     }
 
-    delete state.gif;
-    state.gif = nullptr;
+    delete state.image;
+    state.image = nullptr;
 
     if (gdiplus_token) {
         Gdiplus::GdiplusShutdown(
