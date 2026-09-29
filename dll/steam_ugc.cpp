@@ -1522,7 +1522,83 @@ SteamAPICall_t Steam_UGC::RequestUGCDetails( PublishedFileId_t nPublishedFileID,
 SteamAPICall_t Steam_UGC::RequestUGCDetails_old( PublishedFileId_t nPublishedFileID, uint32 unMaxAgeSeconds )
 {
     PRINT_DEBUG("%llu", nPublishedFileID);
-    return internal_RequestUGCDetails(nPublishedFileID, unMaxAgeSeconds, IUgcItfVersion::v018);
+
+#ifdef _WIN32
+    // MECCHA RequestUGCDetails Download Mod consent
+    if (nPublishedFileID &&
+        nPublishedFileID != k_PublishedFileIdInvalid &&
+        !settings->isModInstalled(nPublishedFileID)) {
+
+        std::string cached_folder;
+
+        if (!get_live_workshop_folder(nPublishedFileID, cached_folder)) {
+            const std::string id_text =
+                std::to_string(static_cast<unsigned long long>(nPublishedFileID));
+
+            const auto request_dir =
+                std::filesystem::u8path(Local_Storage::get_game_settings_path()) /
+                "workshop_requests";
+
+            const auto request_file =
+                request_dir / (id_text + ".request");
+
+            std::error_code ec;
+
+            const bool request_exists =
+                std::filesystem::is_regular_file(request_file, ec) && !ec;
+
+            if (!request_exists) {
+                const std::string prompt =
+                    "MECCHA needs this Steam Workshop map:\n\n"
+                    "Workshop ID: " + id_text +
+                    "\n\nDownload and install this map now?";
+
+                const int response = MessageBoxA(
+                    nullptr,
+                    prompt.c_str(),
+                    "MECCHA Workshop - Download Mod",
+                    MB_YESNO | MB_ICONQUESTION | MB_SETFOREGROUND | MB_TOPMOST
+                );
+
+                if (response == IDYES) {
+                    std::filesystem::create_directories(request_dir, ec);
+
+                    if (!ec) {
+                        std::ofstream out(
+                            request_file,
+                            std::ios::binary | std::ios::trunc
+                        );
+
+                        if (out) {
+                            out << "workshop_id="
+                                << static_cast<unsigned long long>(nPublishedFileID)
+                                << "\n";
+
+                            out << "reason=request_ugc_details_old\n";
+
+                            out << "appid="
+                                << settings->get_local_game_id().AppID()
+                                << "\n";
+
+                            out.close();
+
+                            PRINT_DEBUG(
+                                "MECCHA workshop: RequestUGCDetails_old queued item %llu",
+                                nPublishedFileID
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+#endif
+
+    return internal_RequestUGCDetails(
+        nPublishedFileID,
+        unMaxAgeSeconds,
+        IUgcItfVersion::v018
+    );
 }
 
 SteamAPICall_t Steam_UGC::RequestUGCDetails( PublishedFileId_t nPublishedFileID )
