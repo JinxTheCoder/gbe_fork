@@ -18,6 +18,12 @@
 #include "dll/steam_friends.h"
 #include "dll/dll.h"
 
+#include <filesystem>
+#include <fstream>
+#ifdef _WIN32
+#include <windows.h>
+#endif
+
 #define SEND_FRIEND_RATE 4.0
 
 
@@ -828,8 +834,90 @@ void Steam_Friends::ActivateGameOverlayToUser( const char *pchDialog, CSteamID s
 // full address with protocol type is required, e.g. http://www.steamgames.com/
 void Steam_Friends::ActivateGameOverlayToWebPage( const char *pchURL, EActivateGameOverlayToWebPageMode eMode )
 {
-    PRINT_DEBUG("TODO %s %u", pchURL, eMode);
+    PRINT_DEBUG("TODO %s %u", pchURL ? pchURL : "", eMode);
     std::lock_guard<std::recursive_mutex> lock(global_mutex);
+
+#ifdef _WIN32
+    if (pchURL && pchURL[0]) {
+        const std::string url(pchURL);
+
+        const bool workshop_url =
+            url.find("steamcommunity.com/sharedfiles/filedetails") != std::string::npos ||
+            url.find("steamcommunity.com/workshop/filedetails") != std::string::npos;
+
+        const std::string id_key = "id=";
+        const auto id_pos = url.find(id_key);
+
+        if (workshop_url && id_pos != std::string::npos) {
+            const size_t begin = id_pos + id_key.size();
+            size_t end = begin;
+
+            while (end < url.size() && url[end] >= '0' && url[end] <= '9') {
+                ++end;
+            }
+
+            const std::string id_text = url.substr(begin, end - begin);
+
+            bool valid = !id_text.empty();
+            unsigned long long parsed = 0;
+
+            if (valid) {
+                try {
+                    parsed = std::stoull(id_text);
+                    valid = parsed != 0;
+                } catch (...) {
+                    valid = false;
+                }
+            }
+
+            if (valid) {
+                const auto request_dir =
+                    std::filesystem::u8path(Local_Storage::get_game_settings_path()) /
+                    "workshop_requests";
+
+                const auto request_file =
+                    request_dir / (id_text + ".request");
+
+                std::error_code ec;
+                const bool already_requested =
+                    std::filesystem::is_regular_file(request_file, ec) && !ec;
+
+                if (!already_requested) {
+                    // MECCHA Workshop overlay URL consent
+                    const std::string prompt =
+                        "MECCHA wants to download the missing Steam Workshop map:\n\n"
+                        "Workshop ID: " + id_text +
+                        "\n\nDownload and install this map now?";
+
+                    const int response = MessageBoxA(
+                        nullptr,
+                        prompt.c_str(),
+                        "MECCHA Workshop - Download Mod",
+                        MB_YESNO | MB_ICONQUESTION | MB_SETFOREGROUND | MB_TOPMOST
+                    );
+
+                    if (response != IDYES) {
+                        return;
+                    }
+
+                    std::filesystem::create_directories(request_dir, ec);
+                    if (ec) return;
+
+                    std::ofstream out(request_file, std::ios::binary | std::ios::trunc);
+                    if (!out) return;
+
+                    out << "workshop_id=" << parsed << "\n";
+                    out << "reason=workshop_overlay_url\n";
+                    out << "appid=" << settings->get_local_game_id().AppID() << "\n";
+                    out.close();
+                }
+
+                return;
+            }
+        }
+    }
+#endif
+
     overlay->OpenOverlayWebpage(pchURL);
 }
 

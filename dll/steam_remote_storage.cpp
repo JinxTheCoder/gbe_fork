@@ -17,6 +17,11 @@
 
 #include "dll/steam_remote_storage.h"
 
+#include <fstream>
+#ifdef _WIN32
+#include <windows.h>
+#endif
+
 
 Downloaded_File::Downloaded_File(DownloadSource src)
     :source(src)
@@ -925,56 +930,99 @@ SteamAPICall_t Steam_Remote_Storage::SubscribePublishedFile( PublishedFileId_t u
 {
     PRINT_DEBUG("TODO %llu", unPublishedFileId);
     std::lock_guard<std::recursive_mutex> lock(global_mutex);
-    if (unPublishedFileId == k_PublishedFileIdInvalid) return k_uAPICallInvalid;
 
-    // TODO is this implementation correct?
+    if (!unPublishedFileId || unPublishedFileId == k_PublishedFileIdInvalid) {
+        return k_uAPICallInvalid;
+    }
+
     RemoteStorageSubscribePublishedFileResult_t data{};
     data.m_nPublishedFileId = unPublishedFileId;
 
     if (settings->isModInstalled(unPublishedFileId)) {
-        data.m_eResult = EResult::k_EResultOK;
-        ugc_bridge->add_subbed_mod(unPublishedFileId);
-    } else {
-        data.m_eResult = EResult::k_EResultFail; // TODO is this correct?
-    }
-
-    auto ret = callback_results->addCallResult(data.k_iCallback, &data, sizeof(data));
-    callbacks->addCBResult(data.k_iCallback, &data, sizeof(data));
-    return ret;
-}
-
-STEAM_CALL_RESULT( RemoteStorageEnumerateUserSubscribedFilesResult_t )
-SteamAPICall_t Steam_Remote_Storage::EnumerateUserSubscribedFiles( uint32 unStartIndex )
-{
-    // https://partner.steamgames.com/doc/api/ISteamRemoteStorage
-    PRINT_DEBUG("%u", unStartIndex);
-    std::lock_guard<std::recursive_mutex> lock(global_mutex);
-    // Get ready for a working but bad implementation - Detanup01
-    RemoteStorageEnumerateUserSubscribedFilesResult_t data{};
-    uint32_t modCount = (uint32_t)ugc_bridge->subbed_mods_count();
-    if (unStartIndex >= modCount) {
-        data.m_eResult = EResult::k_EResultInvalidParam; // is this correct?
-    } else {
         data.m_eResult = k_EResultOK;
-        data.m_nTotalResultCount = modCount - unStartIndex; // total amount starting from given index
-        std::set<PublishedFileId_t>::iterator i = ugc_bridge->subbed_mods_itr_begin();
-        std::advance(i, unStartIndex);
-        uint32_t iterated = 0;
-        for (; i != ugc_bridge->subbed_mods_itr_end() && iterated < k_unEnumeratePublishedFilesMaxResults; i++) {
-            PublishedFileId_t modId = *i;
-            auto mod = settings->getMod(modId);
-            uint32 time = mod.timeAddedToUserList; //this can be changed, default is 1554997000
-            data.m_rgPublishedFileId[iterated] = modId;
-            data.m_rgRTimeSubscribed[iterated] = time;
-            iterated++;
-            PRINT_DEBUG("  EnumerateUserSubscribedFiles file %llu", modId);
-        }
-        data.m_nResultsReturned = iterated;
+        ugc_bridge->add_subbed_mod(unPublishedFileId);
+
+        auto ret = callback_results->addCallResult(data.k_iCallback, &data, sizeof(data));
+        callbacks->addCBResult(data.k_iCallback, &data, sizeof(data));
+        return ret;
     }
+
+#ifdef _WIN32
+    // MECCHA legacy SubscribePublishedFile consent
+    const std::string id_text =
+        std::to_string(static_cast<unsigned long long>(unPublishedFileId));
+
+    const auto request_dir =
+        std::filesystem::u8path(Local_Storage::get_game_settings_path()) /
+        "workshop_requests";
+
+    const auto request_file = request_dir / (id_text + ".request");
+
+    std::error_code ec;
+    const bool already_requested =
+        std::filesystem::is_regular_file(request_file, ec) && !ec;
+
+    if (!already_requested) {
+        const std::string prompt =
+            "MECCHA wants to download the missing Steam Workshop map:\n\n"
+            "Workshop ID: " + id_text +
+            "\n\nDownload and install this map now?";
+
+        const int response = MessageBoxA(
+            nullptr,
+            prompt.c_str(),
+            "MECCHA Workshop - Download Mod",
+            MB_YESNO | MB_ICONQUESTION | MB_SETFOREGROUND | MB_TOPMOST
+        );
+
+        if (response != IDYES) {
+            data.m_eResult = k_EResultFail;
+
+            auto ret = callback_results->addCallResult(data.k_iCallback, &data, sizeof(data));
+            callbacks->addCBResult(data.k_iCallback, &data, sizeof(data));
+            return ret;
+        }
+
+        std::filesystem::create_directories(request_dir, ec);
+        if (ec) {
+            data.m_eResult = k_EResultFail;
+
+            auto ret = callback_results->addCallResult(data.k_iCallback, &data, sizeof(data));
+            callbacks->addCBResult(data.k_iCallback, &data, sizeof(data));
+            return ret;
+        }
+
+        std::ofstream out(request_file, std::ios::binary | std::ios::trunc);
+        if (!out) {
+            data.m_eResult = k_EResultFail;
+
+            auto ret = callback_results->addCallResult(data.k_iCallback, &data, sizeof(data));
+            callbacks->addCBResult(data.k_iCallback, &data, sizeof(data));
+            return ret;
+        }
+
+        out << "workshop_id="
+            << static_cast<unsigned long long>(unPublishedFileId)
+            << "\n";
+        out << "reason=legacy_remote_storage_subscribe\n";
+        out << "appid=" << settings->get_local_game_id().AppID() << "\n";
+        out.close();
+    }
+
+    // Match Steam behavior: the subscription request is accepted now and
+    // content installation happens asynchronously.
+    data.m_eResult = k_EResultOK;
 
     auto ret = callback_results->addCallResult(data.k_iCallback, &data, sizeof(data));
     callbacks->addCBResult(data.k_iCallback, &data, sizeof(data));
     return ret;
+#else
+    data.m_eResult = k_EResultFail;
+
+    auto ret = callback_results->addCallResult(data.k_iCallback, &data, sizeof(data));
+    callbacks->addCBResult(data.k_iCallback, &data, sizeof(data));
+    return ret;
+#endif
 }
 
 STEAM_CALL_RESULT( RemoteStorageUnsubscribePublishedFileResult_t )
