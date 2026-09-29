@@ -17,7 +17,7 @@
 
 #include "dll/steam_ugc.h"
 #include "dll/dll.h"
-#include "dll/meccha_workshop_ui.h"
+#include "meccha_workshop_ui.h"
 
 #include <filesystem>
 #include <fstream>

@@ -16,7 +16,7 @@
    <http://www.gnu.org/licenses/>.  */
 
 #include "dll/steam_matchmaking.h"
-#include "dll/meccha_workshop_ui.h"
+#include "meccha_workshop_ui.h"
 
 #include <algorithm>
 #include <atomic>
