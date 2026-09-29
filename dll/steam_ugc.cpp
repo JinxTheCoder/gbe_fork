@@ -1887,17 +1887,82 @@ SteamAPICall_t Steam_UGC::SubscribeItem( PublishedFileId_t nPublishedFileID )
 
     RemoteStorageSubscribePublishedFileResult_t data{};
     data.m_nPublishedFileId = nPublishedFileID;
+
+    if (!nPublishedFileID || nPublishedFileID == k_PublishedFileIdInvalid) {
+        data.m_eResult = k_EResultFail;
+        auto ret = callback_results->addCallResult(data.k_iCallback, &data, sizeof(data));
+        callbacks->addCBResult(data.k_iCallback, &data, sizeof(data));
+        return ret;
+    }
+
     if (settings->isModInstalled(nPublishedFileID)) {
         data.m_eResult = k_EResultOK;
         ugc_bridge->add_subbed_mod(nPublishedFileID);
-    } else {
-        data.m_eResult = k_EResultFail;
+        auto ret = callback_results->addCallResult(data.k_iCallback, &data, sizeof(data));
+        callbacks->addCBResult(data.k_iCallback, &data, sizeof(data));
+        return ret;
     }
+
+#ifdef _WIN32
+    // MECCHA native SubscribeItem consent
+    const std::string id_text = std::to_string(static_cast<unsigned long long>(nPublishedFileID));
+    const auto request_dir = std::filesystem::u8path(Local_Storage::get_game_settings_path()) / "workshop_requests";
+    const auto request_file = request_dir / (id_text + ".request");
+
+    std::error_code ec;
+    const bool already_requested = std::filesystem::is_regular_file(request_file, ec) && !ec;
+
+    if (!already_requested) {
+        const std::string prompt =
+            "MECCHA wants to download the missing Steam Workshop map:\n\n"
+            "Workshop ID: " + id_text +
+            "\n\nDownload and install this map now?";
+
+        const int response = MessageBoxA(
+            nullptr, prompt.c_str(), "MECCHA Workshop - Download Mod",
+            MB_YESNO | MB_ICONQUESTION | MB_SETFOREGROUND | MB_TOPMOST
+        );
+
+        if (response != IDYES) {
+            data.m_eResult = k_EResultFail;
+            auto ret = callback_results->addCallResult(data.k_iCallback, &data, sizeof(data));
+            callbacks->addCBResult(data.k_iCallback, &data, sizeof(data));
+            return ret;
+        }
+
+        std::filesystem::create_directories(request_dir, ec);
+        if (ec) {
+            data.m_eResult = k_EResultFail;
+            auto ret = callback_results->addCallResult(data.k_iCallback, &data, sizeof(data));
+            callbacks->addCBResult(data.k_iCallback, &data, sizeof(data));
+            return ret;
+        }
+
+        std::ofstream out(request_file, std::ios::binary | std::ios::trunc);
+        if (!out) {
+            data.m_eResult = k_EResultFail;
+            auto ret = callback_results->addCallResult(data.k_iCallback, &data, sizeof(data));
+            callbacks->addCBResult(data.k_iCallback, &data, sizeof(data));
+            return ret;
+        }
+
+        out << "workshop_id=" << static_cast<unsigned long long>(nPublishedFileID) << "\n";
+        out << "reason=native_subscribe_button\n";
+        out << "appid=" << settings->get_local_game_id().AppID() << "\n";
+        out.close();
+    }
+
+    data.m_eResult = k_EResultOK;
     auto ret = callback_results->addCallResult(data.k_iCallback, &data, sizeof(data));
     callbacks->addCBResult(data.k_iCallback, &data, sizeof(data));
     return ret;
+#else
+    data.m_eResult = k_EResultFail;
+    auto ret = callback_results->addCallResult(data.k_iCallback, &data, sizeof(data));
+    callbacks->addCBResult(data.k_iCallback, &data, sizeof(data));
+    return ret;
+#endif
 }
- // subscribe to this item, will be installed ASAP
 
 STEAM_CALL_RESULT( RemoteStorageUnsubscribePublishedFileResult_t )
 SteamAPICall_t Steam_UGC::UnsubscribeItem( PublishedFileId_t nPublishedFileID )
@@ -2078,58 +2143,42 @@ bool Steam_UGC::DownloadItem( PublishedFileId_t nPublishedFileID, bool bHighPrio
     std::lock_guard<std::recursive_mutex> lock(global_mutex);
     refresh_live_workshop_cache(settings, ugc_bridge);
 
-    if (!nPublishedFileID || nPublishedFileID == k_PublishedFileIdInvalid) {
-        return false;
-    }
+    if (!nPublishedFileID || nPublishedFileID == k_PublishedFileIdInvalid) return false;
 
     if (!settings->isModInstalled(nPublishedFileID)) {
 #ifdef _WIN32
-        // MECCHA native Download Mod consent
-        const std::string id_text =
-            std::to_string(static_cast<unsigned long long>(nPublishedFileID));
-
-        const std::string prompt =
-            "MECCHA wants to download the missing Steam Workshop map:\n\n"
-            "Workshop ID: " + id_text +
-            "\n\nDownload and install this map now?";
-
-        const int response = MessageBoxA(
-            nullptr,
-            prompt.c_str(),
-            "MECCHA Workshop - Download Mod",
-            MB_YESNO | MB_ICONQUESTION | MB_SETFOREGROUND | MB_TOPMOST
-        );
-
-        if (response != IDYES) {
-            PRINT_DEBUG(
-                "MECCHA workshop: native DownloadItem permission denied for item %llu",
-                nPublishedFileID
-            );
-            return false;
-        }
-
-        const auto request_dir =
-            std::filesystem::u8path(Local_Storage::get_game_settings_path()) /
-            "workshop_requests";
-
-        std::error_code ec;
-        std::filesystem::create_directories(request_dir, ec);
-        if (ec) return false;
-
+        const std::string id_text = std::to_string(static_cast<unsigned long long>(nPublishedFileID));
+        const auto request_dir = std::filesystem::u8path(Local_Storage::get_game_settings_path()) / "workshop_requests";
         const auto request_file = request_dir / (id_text + ".request");
 
-        std::ofstream out(request_file, std::ios::binary | std::ios::trunc);
-        if (!out) return false;
+        std::error_code ec;
+        const bool already_requested = std::filesystem::is_regular_file(request_file, ec) && !ec;
 
-        out << "workshop_id=" << static_cast<unsigned long long>(nPublishedFileID) << "\n";
-        out << "reason=native_download_mod_button\n";
-        out << "appid=" << settings->get_local_game_id().AppID() << "\n";
-        out.close();
+        if (!already_requested) {
+            // MECCHA native Download Mod consent
+            const std::string prompt =
+                "MECCHA wants to download the missing Steam Workshop map:\n\n"
+                "Workshop ID: " + id_text +
+                "\n\nDownload and install this map now?";
 
-        PRINT_DEBUG(
-            "MECCHA workshop: native DownloadItem queued item %llu after permission",
-            nPublishedFileID
-        );
+            if (MessageBoxA(
+                    nullptr, prompt.c_str(), "MECCHA Workshop - Download Mod",
+                    MB_YESNO | MB_ICONQUESTION | MB_SETFOREGROUND | MB_TOPMOST
+                ) != IDYES) {
+                return false;
+            }
+
+            std::filesystem::create_directories(request_dir, ec);
+            if (ec) return false;
+
+            std::ofstream out(request_file, std::ios::binary | std::ios::trunc);
+            if (!out) return false;
+
+            out << "workshop_id=" << static_cast<unsigned long long>(nPublishedFileID) << "\n";
+            out << "reason=native_download_mod_button\n";
+            out << "appid=" << settings->get_local_game_id().AppID() << "\n";
+            out.close();
+        }
 
         return true;
 #else
