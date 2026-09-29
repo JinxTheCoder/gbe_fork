@@ -308,29 +308,96 @@ inline int show_download_consent(
     DownloadConsentState state{};
     state.workshop_id = workshop_id;
 
-    if (gdiplus_status == Gdiplus::Ok) {
-        std::error_code ec;
+    // MECCHA v11.1 robust dialog image loader
+    // Try the supplied path, PNG fallback, the steam_api64.dll folder,
+    // and finally the game EXE folder.
+    auto try_load_image =
+        [&](const std::filesystem::path &candidate) -> bool {
 
-        if (std::filesystem::is_regular_file(
-                gif_path,
-                ec
-            ) && !ec) {
+            if (state.gif) return true;
 
-            state.gif =
+            std::error_code ec;
+            if (!std::filesystem::is_regular_file(candidate, ec) || ec) {
+                return false;
+            }
+
+            auto *image =
                 new Gdiplus::Image(
-                    gif_path.wstring().c_str()
+                    candidate.wstring().c_str()
                 );
 
-            if (!state.gif ||
-                state.gif->GetLastStatus() !=
-                    Gdiplus::Ok) {
+            if (!image ||
+                image->GetLastStatus() != Gdiplus::Ok) {
 
-                delete state.gif;
-                state.gif = nullptr;
+                delete image;
+                return false;
             }
+
+            state.gif = image;
+            return true;
+        };
+
+    if (gdiplus_status == Gdiplus::Ok) {
+        try_load_image(gif_path);
+
+        std::filesystem::path supplied_png = gif_path;
+        supplied_png.replace_extension(".png");
+        try_load_image(supplied_png);
+
+        wchar_t module_file[MAX_PATH]{};
+
+        HMODULE steam_module =
+            GetModuleHandleW(L"steam_api64.dll");
+
+        if (steam_module &&
+            GetModuleFileNameW(
+                steam_module,
+                module_file,
+                MAX_PATH
+            )) {
+
+            const auto module_dir =
+                std::filesystem::path(module_file)
+                    .parent_path();
+
+            try_load_image(
+                module_dir /
+                "steam_settings" /
+                "meccha_dialog.gif"
+            );
+
+            try_load_image(
+                module_dir /
+                "steam_settings" /
+                "meccha_dialog.png"
+            );
+        }
+
+        module_file[0] = L'\0';
+
+        if (GetModuleFileNameW(
+                nullptr,
+                module_file,
+                MAX_PATH
+            )) {
+
+            const auto exe_dir =
+                std::filesystem::path(module_file)
+                    .parent_path();
+
+            try_load_image(
+                exe_dir /
+                "steam_settings" /
+                "meccha_dialog.gif"
+            );
+
+            try_load_image(
+                exe_dir /
+                "steam_settings" /
+                "meccha_dialog.png"
+            );
         }
     }
-
     HINSTANCE instance =
         GetModuleHandleA(nullptr);
 
