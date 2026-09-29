@@ -17,6 +17,7 @@
 
 #include "dll/steam_ugc.h"
 #include "dll/dll.h"
+#include "dll/meccha_workshop_ui.h"
 
 #include <filesystem>
 #include <fstream>
@@ -638,8 +639,47 @@ void Steam_UGC::set_details(PublishedFileId_t id, SteamUGCDetails_t *pDetails, I
                 pDetails->m_ulTotalFilesSize = mod.total_files_sizes;
             }
         } else {
-            PRINT_DEBUG("  mod isn't installed, returning failure");
-            pDetails->m_eResult = k_EResultFail;
+            PRINT_DEBUG("  mod isn't installed, returning remote-style details");
+
+            pDetails->m_eResult = k_EResultOK;
+            pDetails->m_bAcceptedForUse = true;
+            pDetails->m_eFileType = k_EWorkshopFileTypeCommunity;
+            pDetails->m_eVisibility =
+                k_ERemoteStoragePublishedFileVisibilityPublic;
+            pDetails->m_nConsumerAppID =
+                settings->get_local_game_id().AppID();
+            pDetails->m_nCreatorAppID =
+                settings->get_local_game_id().AppID();
+
+            const std::string title =
+                std::string("Workshop ") +
+                std::to_string(
+                    static_cast<unsigned long long>(id)
+                );
+
+            auto copied_chars =
+                title.copy(
+                    pDetails->m_rgchTitle,
+                    sizeof(pDetails->m_rgchTitle) - 1
+                );
+
+            pDetails->m_rgchTitle[copied_chars] = 0;
+
+            const std::string url =
+                std::string(
+                    "https://steamcommunity.com/sharedfiles/filedetails/?id="
+                ) +
+                std::to_string(
+                    static_cast<unsigned long long>(id)
+                );
+
+            copied_chars =
+                url.copy(
+                    pDetails->m_rgchURL,
+                    sizeof(pDetails->m_rgchURL) - 1
+                );
+
+            pDetails->m_rgchURL[copied_chars] = 0;
         }
     }
 }
@@ -1523,84 +1563,14 @@ SteamAPICall_t Steam_UGC::RequestUGCDetails_old( PublishedFileId_t nPublishedFil
 {
     PRINT_DEBUG("%llu", nPublishedFileID);
 
-#ifdef _WIN32
-    // MECCHA RequestUGCDetails Download Mod consent
-    if (nPublishedFileID &&
-        nPublishedFileID != k_PublishedFileIdInvalid &&
-        !settings->isModInstalled(nPublishedFileID)) {
-
-        std::string cached_folder;
-
-        if (!get_live_workshop_folder(nPublishedFileID, cached_folder)) {
-            const std::string id_text =
-                std::to_string(static_cast<unsigned long long>(nPublishedFileID));
-
-            const auto request_dir =
-                std::filesystem::u8path(Local_Storage::get_game_settings_path()) /
-                "workshop_requests";
-
-            const auto request_file =
-                request_dir / (id_text + ".request");
-
-            std::error_code ec;
-
-            const bool request_exists =
-                std::filesystem::is_regular_file(request_file, ec) && !ec;
-
-            if (!request_exists) {
-                const std::string prompt =
-                    "MECCHA needs this Steam Workshop map:\n\n"
-                    "Workshop ID: " + id_text +
-                    "\n\nDownload and install this map now?";
-
-                const int response = MessageBoxA(
-                    nullptr,
-                    prompt.c_str(),
-                    "MECCHA Workshop - Download Mod",
-                    MB_YESNO | MB_ICONQUESTION | MB_SETFOREGROUND | MB_TOPMOST
-                );
-
-                if (response == IDYES) {
-                    std::filesystem::create_directories(request_dir, ec);
-
-                    if (!ec) {
-                        std::ofstream out(
-                            request_file,
-                            std::ios::binary | std::ios::trunc
-                        );
-
-                        if (out) {
-                            out << "workshop_id="
-                                << static_cast<unsigned long long>(nPublishedFileID)
-                                << "\n";
-
-                            out << "reason=request_ugc_details_old\n";
-
-                            out << "appid="
-                                << settings->get_local_game_id().AppID()
-                                << "\n";
-
-                            out.close();
-
-                            PRINT_DEBUG(
-                                "MECCHA workshop: RequestUGCDetails_old queued item %llu",
-                                nPublishedFileID
-                            );
-                        }
-                    }
-                }
-            }
-        }
-    }
-#endif
-
+    // MECCHA v11: RequestUGCDetails is metadata only.
+    // Never open download consent from this API.
     return internal_RequestUGCDetails(
         nPublishedFileID,
         unMaxAgeSeconds,
         IUgcItfVersion::v018
     );
 }
-
 SteamAPICall_t Steam_UGC::RequestUGCDetails( PublishedFileId_t nPublishedFileID )
 {
     PRINT_DEBUG("old");
@@ -1989,15 +1959,13 @@ SteamAPICall_t Steam_UGC::SubscribeItem( PublishedFileId_t nPublishedFileID )
     const bool already_requested = std::filesystem::is_regular_file(request_file, ec) && !ec;
 
     if (!already_requested) {
-        const std::string prompt =
-            "MECCHA wants to download the missing Steam Workshop map:\n\n"
-            "Workshop ID: " + id_text +
-            "\n\nDownload and install this map now?";
-
-        const int response = MessageBoxA(
-            nullptr, prompt.c_str(), "MECCHA Workshop - Download Mod",
-            MB_YESNO | MB_ICONQUESTION | MB_SETFOREGROUND | MB_TOPMOST
-        );
+        const int response =
+            MecchaWorkshopUI::show_download_consent(
+                static_cast<unsigned long long>(nPublishedFileID),
+                std::filesystem::u8path(
+                    Local_Storage::get_game_settings_path()
+                ) / "meccha_dialog.gif"
+            );
 
         if (response != IDYES) {
             data.m_eResult = k_EResultFail;
@@ -2232,14 +2200,11 @@ bool Steam_UGC::DownloadItem( PublishedFileId_t nPublishedFileID, bool bHighPrio
 
         if (!already_requested) {
             // MECCHA native Download Mod consent
-            const std::string prompt =
-                "MECCHA wants to download the missing Steam Workshop map:\n\n"
-                "Workshop ID: " + id_text +
-                "\n\nDownload and install this map now?";
-
-            if (MessageBoxA(
-                    nullptr, prompt.c_str(), "MECCHA Workshop - Download Mod",
-                    MB_YESNO | MB_ICONQUESTION | MB_SETFOREGROUND | MB_TOPMOST
+            if (MecchaWorkshopUI::show_download_consent(
+                    static_cast<unsigned long long>(nPublishedFileID),
+                    std::filesystem::u8path(
+                        Local_Storage::get_game_settings_path()
+                    ) / "meccha_dialog.gif"
                 ) != IDYES) {
                 return false;
             }

@@ -16,6 +16,7 @@
    <http://www.gnu.org/licenses/>.  */
 
 #include "dll/steam_matchmaking.h"
+#include "dll/meccha_workshop_ui.h"
 
 #include <algorithm>
 #include <atomic>
@@ -865,26 +866,21 @@ static void meccha_queue_workshop_request(PublishedFileId_t id, const char *reas
 #endif
 }
 
-static void meccha_begin_workshop_consent(uint64 lobby_id, PublishedFileId_t id, const char *reason, AppId_t appid)
+static void meccha_begin_workshop_consent(
+    uint64 lobby_id,
+    PublishedFileId_t id,
+    const char *reason,
+    AppId_t appid
+)
 {
-    if (!lobby_id || !id || id == k_PublishedFileIdInvalid || meccha_is_workshop_installed(id)) return;
-
-    auto &state = meccha_pending_workshop[lobby_id];
-    state.workshop_id = id;
-    state.waiting_for_download = false;
-    state.denied = false;
-
-#ifdef _WIN32
-    state.waiting_for_consent = true;
-    meccha_start_download_consent_dialog(lobby_id, id);
-    PRINT_DEBUG("MECCHA workshop: asking permission for item %llu reason='%s'", id, reason ? reason : "unknown");
-#else
-    state.waiting_for_consent = false;
-    state.waiting_for_download = true;
-    meccha_queue_workshop_request(id, reason, appid);
-#endif
+    // MECCHA v11: automatic lobby Workshop consent is disabled.
+    // Only an explicit Download Mod request or F8 may start a download.
+    PRINT_DEBUG(
+        "MECCHA workshop: automatic consent suppressed for item %llu reason='%s'",
+        id,
+        reason ? reason : "unknown"
+    );
 }
-
 #ifdef _WIN32
 static void meccha_process_external_workshop_requests(AppId_t fallback_appid)
 {
@@ -1598,27 +1594,12 @@ SteamAPICall_t Steam_Matchmaking::JoinLobby( CSteamID steamIDLobby )
     pending_join.lobby_id = steamIDLobby;
     pending_join.joined = std::chrono::high_resolution_clock::now();
 
-    bool delay_join = false;
-    if (Lobby *known_lobby = get_lobby(steamIDLobby)) {
-        const PublishedFileId_t required = meccha_get_lobby_required_workshop(known_lobby);
-        if (required != k_PublishedFileIdInvalid && !meccha_is_workshop_installed(required)) {
-            meccha_begin_workshop_consent(
-                steamIDLobby.ConvertToUint64(),
-                required,
-                "join_lobby",
-                settings->get_local_game_id().AppID()
-            );
-            delay_join = true;
-            PRINT_DEBUG("MECCHA workshop: delaying lobby join pending permission for item %llu", required);
-        }
-    }
-
-    if (!delay_join) {
-        Lobby_Messages *message = new Lobby_Messages();
-        message->set_type(Lobby_Messages::JOIN);
-        pending_join.message_sent = send_owner_packet(steamIDLobby, message);
-    }
-
+    // MECCHA v11: joining a lobby never asks to download a map.
+    // The user chooses Download Mod in MECCHA or explicitly uses F8.
+    Lobby_Messages *message = new Lobby_Messages();
+    message->set_type(Lobby_Messages::JOIN);
+    pending_join.message_sent =
+        send_owner_packet(steamIDLobby, message);
     pending_joins.push_back(pending_join);
 
     PRINT_DEBUG("added new entry to pending joins");
@@ -2401,14 +2382,40 @@ void Steam_Matchmaking::RunCallbacks()
     if (meccha_take_workshop_dialog_result(workshop_dialog_result)) {
         PublishedFileId_t parsed{};
         if (workshop_dialog_result.empty() || meccha_parse_workshop_id(workshop_dialog_result, parsed)) {
-            meccha_required_workshop_id = workshop_dialog_result;
-
-            if (!workshop_dialog_result.empty()) {
-                meccha_write_last_workshop_id(workshop_dialog_result);
-                meccha_queue_workshop_request(parsed, "host_f8", settings->get_local_game_id().AppID());
-                PRINT_DEBUG("MECCHA workshop: host selected item %s", workshop_dialog_result.c_str());
-            } else {
+            if (workshop_dialog_result.empty()) {
+                meccha_required_workshop_id.clear();
                 PRINT_DEBUG("MECCHA workshop: host map cleared");
+            } else {
+                const int consent =
+                    MecchaWorkshopUI::show_download_consent(
+                        static_cast<unsigned long long>(parsed),
+                        meccha_settings_path() / "meccha_dialog.gif"
+                    );
+
+                if (consent == IDYES) {
+                    meccha_required_workshop_id =
+                        workshop_dialog_result;
+
+                    meccha_write_last_workshop_id(
+                        workshop_dialog_result
+                    );
+
+                    meccha_queue_workshop_request(
+                        parsed,
+                        "host_f8",
+                        settings->get_local_game_id().AppID()
+                    );
+
+                    PRINT_DEBUG(
+                        "MECCHA workshop: host selected item %s",
+                        workshop_dialog_result.c_str()
+                    );
+                } else {
+                    PRINT_DEBUG(
+                        "MECCHA workshop: F8 download cancelled for item %s",
+                        workshop_dialog_result.c_str()
+                    );
+                }
             }
 
             for (auto &lobby : lobbies) {
