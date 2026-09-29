@@ -1025,6 +1025,57 @@ SteamAPICall_t Steam_Remote_Storage::SubscribePublishedFile( PublishedFileId_t u
 #endif
 }
 
+STEAM_CALL_RESULT( RemoteStorageEnumerateUserSubscribedFilesResult_t )
+SteamAPICall_t Steam_Remote_Storage::EnumerateUserSubscribedFiles( uint32 unStartIndex )
+{
+    PRINT_DEBUG("%u", unStartIndex);
+    std::lock_guard<std::recursive_mutex> lock(global_mutex);
+
+    RemoteStorageEnumerateUserSubscribedFilesResult_t data{};
+    uint32_t modCount = (uint32_t)ugc_bridge->subbed_mods_count();
+
+    if (unStartIndex >= modCount) {
+        data.m_eResult = EResult::k_EResultInvalidParam;
+    } else {
+        data.m_eResult = k_EResultOK;
+        data.m_nTotalResultCount = modCount - unStartIndex;
+
+        std::set<PublishedFileId_t>::iterator i = ugc_bridge->subbed_mods_itr_begin();
+        std::advance(i, unStartIndex);
+
+        uint32_t iterated = 0;
+        for (; i != ugc_bridge->subbed_mods_itr_end() &&
+               iterated < k_unEnumeratePublishedFilesMaxResults; i++) {
+
+            PublishedFileId_t modId = *i;
+            auto mod = settings->getMod(modId);
+
+            uint32 time = mod.timeAddedToUserList;
+            data.m_rgPublishedFileId[iterated] = modId;
+            data.m_rgRTimeSubscribed[iterated] = time;
+
+            iterated++;
+            PRINT_DEBUG("  EnumerateUserSubscribedFiles file %llu", modId);
+        }
+
+        data.m_nResultsReturned = iterated;
+    }
+
+    auto ret = callback_results->addCallResult(
+        data.k_iCallback,
+        &data,
+        sizeof(data)
+    );
+
+    callbacks->addCBResult(
+        data.k_iCallback,
+        &data,
+        sizeof(data)
+    );
+
+    return ret;
+}
+
 STEAM_CALL_RESULT( RemoteStorageUnsubscribePublishedFileResult_t )
 SteamAPICall_t Steam_Remote_Storage::UnsubscribePublishedFile( PublishedFileId_t unPublishedFileId )
 {
