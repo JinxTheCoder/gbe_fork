@@ -142,8 +142,10 @@ inline HBITMAP make_scaled_bitmap(
         static_cast<double>(box_h) /
         static_cast<double>(source_h);
 
+    // Fill the entire GIF area instead of letterboxing it.
+    // A small amount of centered cropping is preferable to visible padding.
     const double scale =
-        scale_x < scale_y ? scale_x : scale_y;
+        scale_x > scale_y ? scale_x : scale_y;
 
     int draw_w =
         static_cast<int>(source_w * scale);
@@ -365,13 +367,12 @@ inline bool create_gif_control(
 
     gif.control =
         CreateWindowExA(
-            WS_EX_CLIENTEDGE,
+            0,
             "STATIC",
             "",
             WS_CHILD |
             WS_VISIBLE |
-            SS_BITMAP |
-            SS_CENTERIMAGE,
+            SS_BITMAP,
             x,
             y,
             width,
