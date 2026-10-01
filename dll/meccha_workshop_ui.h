@@ -385,6 +385,40 @@ inline bool create_gif_control(
 
     if (!gif.control) return false;
 
+    // Strip every native edge style after creation as well. Some Windows
+    // configurations/theme paths can still leave a beveled STATIC edge even
+    // when CreateWindowExA was called without one.
+    LONG_PTR style = GetWindowLongPtrA(gif.control, GWL_STYLE);
+    style &= ~static_cast<LONG_PTR>(
+        WS_BORDER |
+        SS_SUNKEN |
+        SS_ETCHEDFRAME
+    );
+    style |= SS_BITMAP;
+    SetWindowLongPtrA(gif.control, GWL_STYLE, style);
+
+    LONG_PTR ex_style = GetWindowLongPtrA(gif.control, GWL_EXSTYLE);
+    ex_style &= ~static_cast<LONG_PTR>(
+        WS_EX_CLIENTEDGE |
+        WS_EX_STATICEDGE |
+        WS_EX_WINDOWEDGE
+    );
+    SetWindowLongPtrA(gif.control, GWL_EXSTYLE, ex_style);
+
+    SetWindowPos(
+        gif.control,
+        nullptr,
+        0,
+        0,
+        0,
+        0,
+        SWP_NOMOVE |
+        SWP_NOSIZE |
+        SWP_NOZORDER |
+        SWP_NOACTIVATE |
+        SWP_FRAMECHANGED
+    );
+
     refresh_gif_bitmap(
         gif,
         width,
