@@ -305,26 +305,17 @@ inline void refresh_gif_bitmap(
 
     if (!next) return;
 
-    HBITMAP old =
-        reinterpret_cast<HBITMAP>(
-            SendMessageA(
-                gif.control,
-                STM_SETIMAGE,
-                IMAGE_BITMAP,
-                reinterpret_cast<LPARAM>(next)
-            )
-        );
+    HBITMAP old = gif.bitmap;
+    gif.bitmap = next;
 
     if (old && old != next) {
         DeleteObject(old);
     }
 
-    gif.bitmap = next;
-
     InvalidateRect(
         gif.control,
         nullptr,
-        TRUE
+        FALSE
     );
 
     UpdateWindow(gif.control);
@@ -354,6 +345,61 @@ inline void advance_gif(
     );
 }
 
+inline LRESULT CALLBACK gif_control_proc(
+    HWND hwnd,
+    UINT msg,
+    WPARAM wparam,
+    LPARAM lparam
+)
+{
+    if (msg == WM_NCCREATE) {
+        auto *create = reinterpret_cast<CREATESTRUCTA *>(lparam);
+        SetWindowLongPtrA(
+            hwnd,
+            GWLP_USERDATA,
+            reinterpret_cast<LONG_PTR>(create->lpCreateParams)
+        );
+        return TRUE;
+    }
+
+    // WM_PAINT covers the entire client area, so no separate erase is needed.
+    if (msg == WM_ERASEBKGND) return 1;
+
+    if (msg == WM_PAINT) {
+        PAINTSTRUCT paint{};
+        HDC dc = BeginPaint(hwnd, &paint);
+        RECT client{};
+        GetClientRect(hwnd, &client);
+        FillRect(dc, &client, GetSysColorBrush(COLOR_BTNFACE));
+
+        auto *gif = reinterpret_cast<GifState *>(
+            GetWindowLongPtrA(hwnd, GWLP_USERDATA)
+        );
+
+        if (gif && gif->bitmap) {
+            HDC memory_dc = CreateCompatibleDC(dc);
+            if (memory_dc) {
+                HGDIOBJ previous = SelectObject(memory_dc, gif->bitmap);
+                if (previous && previous != HGDI_ERROR) {
+                    BitBlt(
+                        dc, 0, 0,
+                        client.right - client.left,
+                        client.bottom - client.top,
+                        memory_dc, 0, 0, SRCCOPY
+                    );
+                    SelectObject(memory_dc, previous);
+                }
+                DeleteDC(memory_dc);
+            }
+        }
+
+        EndPaint(hwnd, &paint);
+        return 0;
+    }
+
+    return DefWindowProcA(hwnd, msg, wparam, lparam);
+}
+
 inline bool create_gif_control(
     HWND parent,
     GifState &gif,
@@ -365,59 +411,40 @@ inline bool create_gif_control(
 {
     if (!gif.image) return false;
 
+    // Paint the GIF ourselves. A native STATIC bitmap control can add a
+    // themed frame or inset; this class only paints the image pixels.
+    HINSTANCE instance = GetModuleHandleA(nullptr);
+    const char class_name[] = "GBE_MECCHA_WORKSHOP_GIF_V13";
+    WNDCLASSEXA wc{};
+    wc.cbSize = sizeof(wc);
+    wc.lpfnWndProc = gif_control_proc;
+    wc.hInstance = instance;
+    wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
+    wc.lpszClassName = class_name;
+
+    if (!RegisterClassExA(&wc) &&
+        GetLastError() != ERROR_CLASS_ALREADY_EXISTS) {
+        return false;
+    }
+
     gif.control =
         CreateWindowExA(
             0,
-            "STATIC",
+            class_name,
             "",
             WS_CHILD |
-            WS_VISIBLE |
-            SS_BITMAP,
+            WS_VISIBLE,
             x,
             y,
             width,
             height,
             parent,
             nullptr,
-            GetModuleHandleA(nullptr),
-            nullptr
+            instance,
+            &gif
         );
 
     if (!gif.control) return false;
-
-    // Strip every native edge style after creation as well. Some Windows
-    // configurations/theme paths can still leave a beveled STATIC edge even
-    // when CreateWindowExA was called without one.
-    LONG_PTR style = GetWindowLongPtrA(gif.control, GWL_STYLE);
-    style &= ~static_cast<LONG_PTR>(
-        WS_BORDER |
-        SS_SUNKEN |
-        SS_ETCHEDFRAME
-    );
-    style |= SS_BITMAP;
-    SetWindowLongPtrA(gif.control, GWL_STYLE, style);
-
-    LONG_PTR ex_style = GetWindowLongPtrA(gif.control, GWL_EXSTYLE);
-    ex_style &= ~static_cast<LONG_PTR>(
-        WS_EX_CLIENTEDGE |
-        WS_EX_STATICEDGE |
-        WS_EX_WINDOWEDGE
-    );
-    SetWindowLongPtrA(gif.control, GWL_EXSTYLE, ex_style);
-
-    SetWindowPos(
-        gif.control,
-        nullptr,
-        0,
-        0,
-        0,
-        0,
-        SWP_NOMOVE |
-        SWP_NOSIZE |
-        SWP_NOZORDER |
-        SWP_NOACTIVATE |
-        SWP_FRAMECHANGED
-    );
 
     refresh_gif_bitmap(
         gif,
