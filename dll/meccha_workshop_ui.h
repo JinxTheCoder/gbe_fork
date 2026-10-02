@@ -10,7 +10,7 @@
 namespace MecchaDialogBrand {
 
 // Change this one line if you ever want a different credit on the dialog title bars.
-inline constexpr wchar_t MECCHA_PATCH_CREDIT[] = L"Patched by J\u0268n\u03C7";
+inline constexpr wchar_t MECCHA_PATCH_CREDIT[] = L"J\u0268n\u03C7";
 
 inline bool starts_with(const char *text, const char *prefix)
 {
@@ -70,7 +70,7 @@ inline void append_patch_credit(std::wstring &title)
     if (title.find(MECCHA_PATCH_CREDIT) != std::wstring::npos) return;
 
     if (!title.empty()) {
-        title += L" - ";
+        title += L" -";
     }
 
     title += MECCHA_PATCH_CREDIT;
