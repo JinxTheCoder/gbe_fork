@@ -1,0 +1,73 @@
+name: MECCHA running DLL diagnostic check
+
+on:
+  push:
+    branches: [PEAK-random-name]
+    paths:
+      - tools/windows/Check_MECCHA_Title.cmd
+      - tools/windows/check_meccha_title.ps1
+      - tests/meccha_title_report_fixture.cpp
+      - .github/workflows/meccha-title-diagnostics.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  diagnostic:
+    runs-on: windows-2022
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v6
+      - name: Find a verified title DLL
+        id: dll-build
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $runs = gh api "repos/${{ github.repository }}/actions/runs?branch=PEAK-random-name&per_page=50" | ConvertFrom-Json
+          $build = $runs.workflow_runs | Where-Object { $_.name -eq "MECCHA verified release DLL" -and $_.conclusion -eq "success" } | Select-Object -First 1
+          if (!$build) { throw "No verified title DLL build was found" }
+          "run_id=$($build.id)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "artifact=MECCHA_Title_Fixed_$($build.head_sha)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ steps.dll-build.outputs.artifact }}
+          run-id: ${{ steps.dll-build.outputs.run_id }}
+          github-token: ${{ github.token }}
+          path: verified_dll
+      - name: Compile real DLL dialog fixture
+        shell: cmd
+        run: |
+          for /f "usebackq tokens=*" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set "MECCHA_VS=%%i"
+          call "%MECCHA_VS%\VC\Auxiliary\Build\vcvarsall.bat" x64
+          cl /nologo /EHsc /std:c++17 /W4 tests\meccha_title_report_fixture.cpp /Fe:meccha_title_report_fixture.exe user32.lib
+      - name: Check report against a separate process running the actual DLL
+        shell: pwsh
+        run: |
+          $dll = Get-ChildItem verified_dll -Recurse -Filter steam_api64.dll | Select-Object -First 1
+          if (!$dll) { throw "The verified DLL was not found" }
+          $expectedHash = (Get-FileHash $dll.FullName -Algorithm SHA256).Hash
+          $env:MECCHA_TITLE_REPORT_PATH = Join-Path $env:GITHUB_WORKSPACE "meccha_title_runtime_report.txt"
+          $env:MECCHA_TITLE_NO_VIEWER = "1"
+          $env:MECCHA_TITLE_CHECK_NO_PAUSE = "1"
+          $ready = [Threading.EventWaitHandle]::new($false, [Threading.EventResetMode]::ManualReset, "Local\MECCHA_Title_Test_Ready")
+          $fixture = Start-Process -FilePath .\meccha_title_report_fixture.exe -ArgumentList ('"' + $dll.FullName + '"') -PassThru -NoNewWindow
+          if (!$ready.WaitOne(20000)) { throw "The actual DLL dialog did not become ready" }
+          & .\tools\windows\Check_MECCHA_Title.cmd
+          if ($LASTEXITCODE -ne 0) { throw "The diagnostic command failed" }
+          if (!$fixture.WaitForExit(10000)) { throw "The dialog did not close after the report was collected" }
+          if ($fixture.ExitCode -ne 0) { throw "The fixture did not observe the dialog and report" }
+          $report = Get-Content $env:MECCHA_TITLE_REPORT_PATH -Raw
+          if ($report -notmatch "Window class: GBE_MECCHA_WORKSHOP_MESSAGE_V15") { throw "The report did not identify the live window version" }
+          if ($report -notmatch "Native caption: False") { throw "The report did not detect the custom title bar" }
+          if ($report -notmatch [regex]::Escape("SHA256: " + $expectedHash)) { throw "The report did not identify the actual loaded DLL hash" }
+          Write-Output $report
+          $ready.Dispose()
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: meccha_running_dll_report
+          path: meccha_title_runtime_report.txt
+          if-no-files-found: warn
