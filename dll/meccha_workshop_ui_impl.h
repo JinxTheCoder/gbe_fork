@@ -414,7 +414,7 @@ inline bool create_gif_control(
     // Paint the GIF ourselves. A native STATIC bitmap control can add a
     // themed frame or inset; this class only paints the image pixels.
     HINSTANCE instance = GetModuleHandleA(nullptr);
-    const char class_name[] = "GBE_MECCHA_WORKSHOP_GIF_V13";
+    const char class_name[] = "GBE_MECCHA_WORKSHOP_GIF_V14";
     WNDCLASSEXA wc{};
     wc.cbSize = sizeof(wc);
     wc.lpfnWndProc = gif_control_proc;
@@ -754,7 +754,7 @@ inline int show_message_dialog(
         GetModuleHandleA(nullptr);
 
     const char class_name[] =
-        "GBE_MECCHA_WORKSHOP_MESSAGE_V12";
+        "GBE_MECCHA_WORKSHOP_MESSAGE_V14";
 
     WNDCLASSEXA wc{};
     wc.cbSize = sizeof(wc);
@@ -1947,7 +1947,7 @@ inline bool show_f8_import_dialog(
         GetModuleHandleA(nullptr);
 
     const char class_name[] =
-        "GBE_MECCHA_WORKSHOP_IMPORT_V12";
+        "GBE_MECCHA_WORKSHOP_IMPORT_V14";
 
     WNDCLASSEXA wc{};
     wc.cbSize = sizeof(wc);

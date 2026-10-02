@@ -1,0 +1,35 @@
+name: MECCHA dialog runtime check
+
+on:
+  push:
+    branches: [PEAK-random-name]
+    paths:
+      - dll/meccha_workshop_ui.h
+      - dll/meccha_workshop_ui_impl.h
+      - dll/meccha_dialog_gif_data.h
+      - tests/meccha_dialog_caption.cpp
+      - .github/workflows/meccha-dialog-check.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  dialog-check:
+    runs-on: windows-2022
+    timeout-minutes: 5
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [x64, x86]
+    steps:
+      - uses: actions/checkout@v6
+      - name: Compile actual dialog code
+        shell: cmd
+        run: |
+          for /f "usebackq tokens=*" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set "MECCHA_VS=%%i"
+          call "%MECCHA_VS%\VC\Auxiliary\Build\vcvarsall.bat" ${{ matrix.arch }}
+          cl /nologo /EHsc /std:c++17 /W4 /I dll tests\meccha_dialog_caption.cpp /Fe:meccha_dialog_caption.exe user32.lib gdi32.lib gdiplus.lib ole32.lib comdlg32.lib
+      - name: Verify captions and GIF controls in Windows
+        shell: cmd
+        run: meccha_dialog_caption.exe

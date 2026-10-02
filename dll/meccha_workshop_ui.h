@@ -179,7 +179,7 @@ inline HWND WINAPI create_window_ex_a(
         append_patch_credit(title_w);
     }
 
-    return ::CreateWindowExW(
+    HWND hwnd = ::CreateWindowExW(
         ex_style,
         class_name_w.c_str(),
         title_w.c_str(),
@@ -193,6 +193,15 @@ inline HWND WINAPI create_window_ex_a(
         instance,
         parameter
     );
+
+    // Assign the Unicode caption after creation as well, so it cannot be
+    // lost while a custom window procedure initializes the dialog.
+    if (hwnd && !(style & WS_CHILD) && !title_w.empty()) {
+        ::SetWindowTextW(hwnd, title_w.c_str());
+        ::RedrawWindow(hwnd, nullptr, nullptr, RDW_FRAME | RDW_INVALIDATE);
+    }
+
+    return hwnd;
 }
 
 inline LRESULT WINAPI def_window_proc_a(
