@@ -1,6 +1,14 @@
 name: "Build emu (Windows)"
 
 on:
+  push:
+    branches: [PEAK-random-name]
+    paths:
+      - dll/meccha_workshop_ui.h
+      - dll/meccha_workshop_ui_impl.h
+      - dll/meccha_dialog_gif_data.h
+      - tests/meccha_built_dll_caption.cpp
+      - .github/workflows/emu-build-all-win-vs22.yml
   workflow_call:
     # needed since it allows this to become a reusable workflow
   workflow_dispatch:
@@ -30,7 +38,7 @@ jobs:
     needs: ["deps"]
     runs-on: "windows-2022"
     if: ${{ !cancelled() }}
-    continue-on-error: true
+    continue-on-error: ${{ matrix.cfg != 'release' || matrix.arch != 'x64' || (matrix.prj != 'api_regular' && matrix.prj != 'api_experimental') }}
 
     strategy:
       fail-fast: false
@@ -113,6 +121,32 @@ jobs:
         working-directory: "${{ github.workspace }}/build/project/vs2022/win"
         run: |
           msbuild /nologo /target:${{ matrix.prj }} /m:1 -p:CL_MPCount=${{ env.MAX_PARALLEL_JOBS }} /v:n /p:Configuration=${{ matrix.cfg }},Platform=${{ matrix.arch }} gbe.sln
+
+      - name: "Compile release DLL title probe"
+        if: matrix.cfg == 'release' && matrix.arch == 'x64' && (matrix.prj == 'api_regular' || matrix.prj == 'api_experimental')
+        shell: "cmd"
+        run: |
+          for /f "usebackq tokens=*" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set "MECCHA_VS=%%i"
+          call "%MECCHA_VS%\VC\Auxiliary\Build\vcvarsall.bat" x64
+          cl /nologo /EHsc /std:c++17 /W4 tests\meccha_built_dll_caption.cpp /Fe:meccha_built_dll_caption.exe user32.lib gdi32.lib
+
+      - name: "Verify the title from this DLL before publishing it"
+        if: matrix.cfg == 'release' && matrix.arch == 'x64' && (matrix.prj == 'api_regular' || matrix.prj == 'api_experimental')
+        shell: "pwsh"
+        run: |
+          $dll = Get-ChildItem build/win -Recurse -Filter steam_api64.dll | Select-Object -First 1
+          if (!$dll) { throw "The built steam_api64.dll was not found" }
+          .\meccha_built_dll_caption.exe $dll.FullName
+          if ($LASTEXITCODE -ne 0) { throw "The compiled DLL title check failed" }
+
+      - name: "Upload actual DLL dialog capture"
+        if: always() && (matrix.cfg == 'release' && matrix.arch == 'x64' && (matrix.prj == 'api_regular' || matrix.prj == 'api_experimental'))
+        uses: actions/upload-artifact@v7
+        with:
+          name: "meccha-caption-${{ matrix.prj }}-${{ github.sha }}"
+          path: meccha_compiled_dll_caption.bmp
+          if-no-files-found: warn
+          retention-days: 7
 
       # upload artifact/package to github Actions
       - name: "Upload target package"
