@@ -1,0 +1,81 @@
+name: MECCHA verified release DLL
+
+on:
+  push:
+    branches: [PEAK-random-name]
+    paths:
+      - dll/meccha_workshop_ui.h
+      - dll/meccha_workshop_ui_impl.h
+      - dll/meccha_dialog_gif_data.h
+      - tests/meccha_built_dll_caption.cpp
+      - .github/workflows/meccha-release.yml
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  PREMAKE_ACTION: vs2022
+  DEPS_CACHE_KEY: emu-deps-win
+  DEPS_CACHE_DIR: build/deps/win
+  THIRD_PARTY_BASE_DIR: third-party
+  MAX_PARALLEL_JOBS: 4
+
+jobs:
+  deps:
+    uses: ./.github/workflows/emu-deps-win-vs22.yml
+
+  release:
+    needs: deps
+    runs-on: windows-2022
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+      - uses: microsoft/setup-msbuild@v3
+      - name: Preserve source line endings
+        shell: cmd
+        run: |
+          git config --local core.autocrlf false
+          git config --system core.autocrlf false
+          git config --global core.autocrlf false
+      - uses: actions/cache@v5
+        with:
+          key: ${{ env.DEPS_CACHE_KEY }}-${{ env.PREMAKE_ACTION }}
+          path: ${{ env.DEPS_CACHE_DIR }}/${{ env.PREMAKE_ACTION }}
+      - uses: actions/checkout@v6
+        with:
+          repository: Detanup01/gbe_fork
+          ref: third-party/common/win
+          path: ${{ env.THIRD_PARTY_BASE_DIR }}/common/win
+      - uses: actions/checkout@v6
+        with:
+          repository: Detanup01/gbe_fork
+          ref: third-party/build/win
+          path: ${{ env.THIRD_PARTY_BASE_DIR }}/build/win
+      - name: Generate project files
+        shell: cmd
+        run: |
+          "${{ env.THIRD_PARTY_BASE_DIR }}\common\win\premake\premake5.exe" --file=premake5.lua --genproto --emubuild=${{ github.sha }} --dosstub --winrsrc --winsign --os=windows vs2022
+      - name: Build replacement steam_api64.dll
+        shell: cmd
+        working-directory: build/project/vs2022/win
+        run: |
+          msbuild /nologo /target:api_regular /m:1 -p:CL_MPCount=${{ env.MAX_PARALLEL_JOBS }} /v:n /p:Configuration=release,Platform=x64 gbe.sln
+      - name: Compile actual DLL dialog probe
+        shell: cmd
+        run: |
+          for /f "usebackq tokens=*" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set "MECCHA_VS=%%i"
+          call "%MECCHA_VS%\VC\Auxiliary\Build\vcvarsall.bat" x64
+          cl /nologo /EHsc /std:c++17 /W4 tests\meccha_built_dll_caption.cpp /Fe:meccha_built_dll_caption.exe user32.lib gdi32.lib
+      - name: Verify and capture the dialog from this build
+        shell: cmd
+        run: meccha_built_dll_caption.exe build\win\vs2022\release\regular\x64\steam_api64.dll
+      - uses: actions/upload-artifact@v7
+        with:
+          name: MECCHA_Title_Fixed_${{ github.sha }}
+          path: |
+            build/win/vs2022/release/regular/x64/steam_api64.dll
+            meccha_compiled_dll_caption.bmp
+          if-no-files-found: error
+          compression-level: 9
+          retention-days: 30

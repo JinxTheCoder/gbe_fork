@@ -54,13 +54,16 @@ BOOL CALLBACK inspect(HWND hwnd, LPARAM)
     wchar_t title[512]{};
     GetWindowTextW(hwnd, title, 512);
     const std::wstring expected = L"MECCHA Workshop - Missing Map -J\u0268n\u03C7";
-    passed = std::wstring(title) == expected;
+    passed = std::wstring(title) == expected &&
+             std::wstring(name) == L"GBE_MECCHA_WORKSHOP_MESSAGE_V15" &&
+             (GetWindowLongPtrW(hwnd, GWL_STYLE) & WS_CAPTION) != WS_CAPTION &&
+             GetDlgItem(hwnd, 6206) != nullptr;
     std::wcerr << L"COMPILED DLL CAPTION: [" << title << L"]\n";
     if (!capture(hwnd)) {
         std::cerr << "Window capture failed\n";
         passed = false;
     }
-    PostMessageW(hwnd, WM_COMMAND, IDCANCEL, 0);
+    PostMessageW(GetDlgItem(hwnd, 6206), BM_CLICK, 0, 0);
     return FALSE;
 }
 
@@ -98,6 +101,6 @@ int wmain(int argc, wchar_t **argv)
         std::cerr << "FAIL: actual compiled DLL caption was missing or incorrect\n";
         return 1;
     }
-    std::cout << "PASS: actual release DLL opened through exported Steam API and retained the exact Unicode caption\n";
+    std::cout << "PASS: actual release DLL opened through exported Steam API, uses the custom title bar, and retains the exact Unicode caption\n";
     return 0;
 }

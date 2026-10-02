@@ -32,46 +32,6 @@ jobs:
           for /f "usebackq tokens=*" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set "MECCHA_VS=%%i"
           call "%MECCHA_VS%\VC\Auxiliary\Build\vcvarsall.bat" ${{ matrix.arch }}
           cl /nologo /EHsc /std:c++17 /W4 /I dll tests\meccha_dialog_caption.cpp /Fe:meccha_dialog_caption.exe user32.lib gdi32.lib gdiplus.lib ole32.lib comdlg32.lib
-      - name: Verify captions and GIF controls in Windows
+      - name: Verify custom titles, close and drag behavior, and GIF controls
         shell: cmd
         run: meccha_dialog_caption.exe
-      - name: Find latest completed DLL build
-        if: matrix.arch == 'x64'
-        id: compiled-build
-        shell: pwsh
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          $runs = gh api "repos/${{ github.repository }}/actions/runs?branch=PEAK-random-name&per_page=20" | ConvertFrom-Json
-          $build = $runs.workflow_runs | Where-Object { $_.name -eq "Build emu (Windows)" -and $_.conclusion -eq "success" } | Select-Object -First 1
-          if (!$build) { throw "No completed DLL build was found" }
-          "run_id=$($build.id)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
-          "artifact=emu-win-vs22-api_regular-release-x64-$($build.head_sha)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
-      - uses: actions/download-artifact@v4
-        if: matrix.arch == 'x64'
-        with:
-          name: ${{ steps.compiled-build.outputs.artifact }}
-          run-id: ${{ steps.compiled-build.outputs.run_id }}
-          github-token: ${{ github.token }}
-          path: compiled_artifact
-      - name: Compile release DLL probe
-        if: matrix.arch == 'x64'
-        shell: cmd
-        run: |
-          for /f "usebackq tokens=*" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set "MECCHA_VS=%%i"
-          call "%MECCHA_VS%\VC\Auxiliary\Build\vcvarsall.bat" x64
-          cl /nologo /EHsc /std:c++17 /W4 tests\meccha_built_dll_caption.cpp /Fe:meccha_built_dll_caption.exe user32.lib gdi32.lib
-      - name: Open and capture the dialog from the actual compiled DLL
-        if: matrix.arch == 'x64'
-        shell: pwsh
-        run: |
-          $dll = Get-ChildItem compiled_artifact -Recurse -Filter steam_api64.dll | Select-Object -First 1
-          if (!$dll) { throw "Compiled steam_api64.dll was not found" }
-          .\meccha_built_dll_caption.exe $dll.FullName
-          if ($LASTEXITCODE -ne 0) { throw "Actual compiled DLL caption check failed" }
-      - uses: actions/upload-artifact@v7
-        if: always() && matrix.arch == 'x64'
-        with:
-          name: meccha_compiled_caption_capture
-          path: meccha_compiled_dll_caption.bmp
-          if-no-files-found: warn

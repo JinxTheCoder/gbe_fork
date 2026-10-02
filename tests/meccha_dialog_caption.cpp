@@ -24,7 +24,20 @@ BOOL CALLBACK inspect_dialog(HWND hwnd, LPARAM)
         passed = false;
     }
 
-    HWND gif = FindWindowExW(hwnd, nullptr, L"GBE_MECCHA_WORKSHOP_GIF_V14", nullptr);
+    const LONG_PTR window_style = GetWindowLongPtrW(hwnd, GWL_STYLE);
+    if ((window_style & WS_CAPTION) == WS_CAPTION ||
+        !GetDlgItem(hwnd, MecchaWorkshopUI::BTN_CLOSE)) {
+        std::cerr << "Dialog still relies on a native caption or has no close button\n";
+        passed = false;
+    }
+    POINT drag_point{20, MecchaWorkshopUI::DIALOG_TITLE_HEIGHT / 2};
+    ClientToScreen(hwnd, &drag_point);
+    if (SendMessageW(hwnd, WM_NCHITTEST, 0, MAKELPARAM(drag_point.x, drag_point.y)) != HTCAPTION) {
+        std::cerr << "Custom title bar cannot drag the dialog\n";
+        passed = false;
+    }
+
+    HWND gif = FindWindowExW(hwnd, nullptr, L"GBE_MECCHA_WORKSHOP_GIF_V15", nullptr);
     if (!gif) {
         std::cerr << "Embedded GIF control was not created\n";
         passed = false;
@@ -44,7 +57,11 @@ BOOL CALLBACK inspect_dialog(HWND hwnd, LPARAM)
         }
     }
 
-    PostMessageW(hwnd, WM_COMMAND, close_command, 0);
+    if (close_command == MecchaWorkshopUI::BTN_CLOSE) {
+        PostMessageW(GetDlgItem(hwnd, close_command), BM_CLICK, 0, 0);
+    } else {
+        PostMessageW(hwnd, WM_COMMAND, close_command, 0);
+    }
     return FALSE;
 }
 
@@ -75,14 +92,14 @@ void end_check(UINT_PTR timer)
 int main()
 {
     UINT_PTR timer = begin_check(
-        L"GBE_MECCHA_WORKSHOP_MESSAGE_V14",
+        L"GBE_MECCHA_WORKSHOP_MESSAGE_V15",
         L"MECCHA Workshop - Missing Map -J\u0268n\u03C7", IDCANCEL);
     if (!timer) return 2;
     MecchaWorkshopUI::show_download_consent(3772646297ULL, std::filesystem::path{L"test"});
     end_check(timer);
 
     timer = begin_check(
-        L"GBE_MECCHA_WORKSHOP_MESSAGE_V14",
+        L"GBE_MECCHA_WORKSHOP_MESSAGE_V15",
         L"MECCHA Workshop - How Friend Can Export -J\u0268n\u03C7",
         MecchaWorkshopUI::BTN_BACK);
     if (!timer) return 2;
@@ -90,15 +107,15 @@ int main()
     end_check(timer);
 
     timer = begin_check(
-        L"GBE_MECCHA_WORKSHOP_MESSAGE_V14",
+        L"GBE_MECCHA_WORKSHOP_MESSAGE_V15",
         L"MECCHA Workshop - Import Complete -J\u0268n\u03C7", IDOK);
     if (!timer) return 2;
     MecchaWorkshopUI::show_notice("MECCHA Workshop - Import Complete", "Test notice");
     end_check(timer);
 
     timer = begin_check(
-        L"GBE_MECCHA_WORKSHOP_IMPORT_V14",
-        L"MECCHA Workshop - Import Mod -J\u0268n\u03C7", IDCANCEL);
+        L"GBE_MECCHA_WORKSHOP_IMPORT_V15",
+        L"MECCHA Workshop - Import Mod -J\u0268n\u03C7", MecchaWorkshopUI::BTN_CLOSE);
     if (!timer) return 2;
     std::string value;
     if (MecchaWorkshopUI::show_f8_import_dialog("", std::filesystem::path{L"test"}, value)) {
@@ -108,6 +125,6 @@ int main()
     end_check(timer);
 
     if (!passed) return 1;
-    std::cout << "PASS: four actual dialogs retain the exact Unicode caption; GIF frames render without native borders\n";
+    std::cout << "PASS: four dialogs use custom Unicode title bars with close and drag support; GIF frames render without native borders\n";
     return 0;
 }

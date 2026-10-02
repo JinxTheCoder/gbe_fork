@@ -25,7 +25,7 @@
 
 namespace MecchaWorkshopUI {
 
-// MECCHA v12
+// MECCHA v15
 // All MECCHA Workshop dialogs use the animated GIF embedded in steam_api64.dll.
 // Workshop downloads are imported from a ZIP supplied by the user. SteamCMD
 // authentication is intentionally not part of this UI.
@@ -36,6 +36,9 @@ constexpr int BTN_HELP = 6202;
 constexpr int BTN_COPY = 6203;
 constexpr int BTN_BACK = 6204;
 constexpr int BTN_CLEAR = 6205;
+constexpr int BTN_CLOSE = 6206;
+constexpr int DIALOG_TITLE_HEIGHT = 32;
+constexpr int DIALOG_CLOSE_WIDTH = 40;
 
 struct GifState {
     Gdiplus::Image *image{};
@@ -47,6 +50,7 @@ struct GifState {
 };
 
 struct MessageDialogState {
+    std::wstring title{};
     std::string body{};
     std::vector<std::pair<int, std::string>> buttons{};
     int result{IDCANCEL};
@@ -65,6 +69,7 @@ struct MessageDialogState {
 };
 
 struct ImportDialogState {
+    std::wstring title{};
     std::string initial{};
     std::string value{};
     std::filesystem::path settings_root{};
@@ -73,6 +78,64 @@ struct ImportDialogState {
     bool done{};
     GifState gif{};
 };
+
+inline std::wstring branded_dialog_title(const char *title)
+{
+    std::wstring result = MecchaDialogBrand::narrow_to_wide(title);
+    MecchaDialogBrand::append_patch_credit(result);
+    return result;
+}
+
+inline void draw_dialog_title(HWND hwnd, HDC dc, const std::wstring &title)
+{
+    RECT bounds{};
+    GetClientRect(hwnd, &bounds);
+    bounds.bottom = DIALOG_TITLE_HEIGHT;
+    FillRect(dc, &bounds, reinterpret_cast<HBRUSH>(GetStockObject(WHITE_BRUSH)));
+
+    RECT text_rect = bounds;
+    text_rect.left = 12;
+    text_rect.right -= DIALOG_CLOSE_WIDTH + 8;
+    HFONT font = CreateFontW(
+        -16, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+        CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
+    HGDIOBJ old_font = SelectObject(dc, font ? reinterpret_cast<HGDIOBJ>(font) : GetStockObject(DEFAULT_GUI_FONT));
+    const int old_mode = SetBkMode(dc, TRANSPARENT);
+    const COLORREF old_color = SetTextColor(dc, RGB(32, 32, 32));
+    DrawTextW(dc, title.c_str(), -1, &text_rect,
+              DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
+    SetTextColor(dc, old_color);
+    SetBkMode(dc, old_mode);
+    SelectObject(dc, old_font);
+    if (font) DeleteObject(font);
+}
+
+inline void create_dialog_close_button(HWND hwnd)
+{
+    RECT bounds{};
+    GetClientRect(hwnd, &bounds);
+    HWND button = CreateWindowExW(
+        0, L"BUTTON", L"\u00D7", WS_CHILD | WS_VISIBLE | BS_FLAT,
+        bounds.right - DIALOG_CLOSE_WIDTH, 0,
+        DIALOG_CLOSE_WIDTH, DIALOG_TITLE_HEIGHT, hwnd,
+        reinterpret_cast<HMENU>(static_cast<INT_PTR>(BTN_CLOSE)),
+        GetModuleHandleW(nullptr), nullptr);
+    if (button) {
+        SendMessageW(button, WM_SETFONT,
+                     reinterpret_cast<WPARAM>(GetStockObject(DEFAULT_GUI_FONT)), TRUE);
+    }
+}
+
+inline bool is_dialog_title_point(HWND hwnd, LPARAM position)
+{
+    POINT point{static_cast<short>(LOWORD(position)), static_cast<short>(HIWORD(position))};
+    ScreenToClient(hwnd, &point);
+    RECT bounds{};
+    GetClientRect(hwnd, &bounds);
+    return point.x >= 0 && point.x < bounds.right - DIALOG_CLOSE_WIDTH &&
+           point.y >= 0 && point.y < DIALOG_TITLE_HEIGHT;
+}
 
 inline bool directory_has_files(const std::filesystem::path &path)
 {
@@ -414,7 +477,7 @@ inline bool create_gif_control(
     // Paint the GIF ourselves. A native STATIC bitmap control can add a
     // themed frame or inset; this class only paints the image pixels.
     HINSTANCE instance = GetModuleHandleA(nullptr);
-    const char class_name[] = "GBE_MECCHA_WORKSHOP_GIF_V14";
+    const char class_name[] = "GBE_MECCHA_WORKSHOP_GIF_V15";
     WNDCLASSEXA wc{};
     wc.cbSize = sizeof(wc);
     wc.lpfnWndProc = gif_control_proc;
@@ -533,6 +596,8 @@ inline LRESULT CALLBACK message_dialog_proc(
 
             if (!state) return -1;
 
+            create_dialog_close_button(hwnd);
+
             HFONT font =
                 reinterpret_cast<HFONT>(
                     GetStockObject(
@@ -594,7 +659,7 @@ inline LRESULT CALLBACK message_dialog_proc(
                 (state->width - total_width) / 2;
 
             const int button_y =
-                state->height - 78;
+                state->height - 78 + DIALOG_TITLE_HEIGHT;
 
             for (int i = 0; i < count; ++i) {
                 const auto &entry =
@@ -651,6 +716,22 @@ inline LRESULT CALLBACK message_dialog_proc(
             return 0;
         }
 
+        case WM_PAINT: {
+            PAINTSTRUCT paint{};
+            HDC dc = BeginPaint(hwnd, &paint);
+            if (state) draw_dialog_title(hwnd, dc, state->title);
+            EndPaint(hwnd, &paint);
+            return 0;
+        }
+
+        case WM_PRINTCLIENT:
+            if (state) draw_dialog_title(hwnd, reinterpret_cast<HDC>(wparam), state->title);
+            return 0;
+
+        case WM_NCHITTEST:
+            if (is_dialog_title_point(hwnd, lparam)) return HTCAPTION;
+            break;
+
         case WM_TIMER:
             if (state &&
                 wparam == GIF_TIMER_ID) {
@@ -665,6 +746,12 @@ inline LRESULT CALLBACK message_dialog_proc(
         case WM_COMMAND:
             if (state) {
                 const int id = LOWORD(wparam);
+
+                if (id == BTN_CLOSE) {
+                    state->result = IDCANCEL;
+                    DestroyWindow(hwnd);
+                    return 0;
+                }
 
                 for (const auto &entry :
                      state->buttons) {
@@ -737,14 +824,16 @@ inline int show_message_dialog(
         );
 
     MessageDialogState state{};
+    state.title = branded_dialog_title(title.c_str());
     state.body = body;
     state.buttons = buttons;
     state.width = width;
     state.height = height;
     state.text_width = text_width;
     state.text_height = text_height;
+    state.text_y += DIALOG_TITLE_HEIGHT;
     state.gif_x = gif_x;
-    state.gif_y = gif_y;
+    state.gif_y = gif_y + DIALOG_TITLE_HEIGHT;
 
     if (status == Gdiplus::Ok) {
         load_embedded_gif(state.gif);
@@ -754,7 +843,7 @@ inline int show_message_dialog(
         GetModuleHandleA(nullptr);
 
     const char class_name[] =
-        "GBE_MECCHA_WORKSHOP_MESSAGE_V14";
+        "GBE_MECCHA_WORKSHOP_MESSAGE_V15";
 
     WNDCLASSEXA wc{};
     wc.cbSize = sizeof(wc);
@@ -789,11 +878,12 @@ inline int show_message_dialog(
 
     HWND hwnd =
         CreateWindowExA(
-            WS_EX_DLGMODALFRAME |
             WS_EX_TOPMOST,
             class_name,
             title.c_str(),
-            WS_CAPTION |
+            WS_POPUP |
+            WS_BORDER |
+            WS_CLIPCHILDREN |
             WS_SYSMENU,
             x,
             y,
@@ -1625,6 +1715,8 @@ inline LRESULT CALLBACK import_dialog_proc(
 
             if (!state) return -1;
 
+            create_dialog_close_button(hwnd);
+
             HFONT font =
                 reinterpret_cast<HFONT>(
                     GetStockObject(
@@ -1640,7 +1732,7 @@ inline LRESULT CALLBACK import_dialog_proc(
                     WS_CHILD |
                     WS_VISIBLE,
                     20,
-                    22,
+                    22 + DIALOG_TITLE_HEIGHT,
                     410,
                     22,
                     hwnd,
@@ -1657,7 +1749,7 @@ inline LRESULT CALLBACK import_dialog_proc(
                     WS_CHILD |
                     WS_VISIBLE,
                     20,
-                    58,
+                    58 + DIALOG_TITLE_HEIGHT,
                     360,
                     20,
                     hwnd,
@@ -1676,7 +1768,7 @@ inline LRESULT CALLBACK import_dialog_proc(
                     WS_TABSTOP |
                     ES_AUTOHSCROLL,
                     20,
-                    82,
+                    82 + DIALOG_TITLE_HEIGHT,
                     390,
                     27,
                     hwnd,
@@ -1695,7 +1787,7 @@ inline LRESULT CALLBACK import_dialog_proc(
                     WS_CHILD |
                     WS_VISIBLE,
                     20,
-                    120,
+                    120 + DIALOG_TITLE_HEIGHT,
                     410,
                     38,
                     hwnd,
@@ -1714,7 +1806,7 @@ inline LRESULT CALLBACK import_dialog_proc(
                     WS_TABSTOP |
                     BS_DEFPUSHBUTTON,
                     140,
-                    182,
+                    182 + DIALOG_TITLE_HEIGHT,
                     120,
                     32,
                     hwnd,
@@ -1734,7 +1826,7 @@ inline LRESULT CALLBACK import_dialog_proc(
                     WS_VISIBLE |
                     WS_TABSTOP,
                     270,
-                    182,
+                    182 + DIALOG_TITLE_HEIGHT,
                     120,
                     32,
                     hwnd,
@@ -1754,7 +1846,7 @@ inline LRESULT CALLBACK import_dialog_proc(
                     WS_VISIBLE |
                     WS_TABSTOP,
                     400,
-                    182,
+                    182 + DIALOG_TITLE_HEIGHT,
                     90,
                     32,
                     hwnd,
@@ -1789,7 +1881,7 @@ inline LRESULT CALLBACK import_dialog_proc(
                 hwnd,
                 state->gif,
                 500,
-                24,
+                24 + DIALOG_TITLE_HEIGHT,
                 180,
                 142
             );
@@ -1816,6 +1908,22 @@ inline LRESULT CALLBACK import_dialog_proc(
                 );
             }
             return 0;
+
+        case WM_PAINT: {
+            PAINTSTRUCT paint{};
+            HDC dc = BeginPaint(hwnd, &paint);
+            if (state) draw_dialog_title(hwnd, dc, state->title);
+            EndPaint(hwnd, &paint);
+            return 0;
+        }
+
+        case WM_PRINTCLIENT:
+            if (state) draw_dialog_title(hwnd, reinterpret_cast<HDC>(wparam), state->title);
+            return 0;
+
+        case WM_NCHITTEST:
+            if (is_dialog_title_point(hwnd, lparam)) return HTCAPTION;
+            break;
 
         case WM_COMMAND:
             if (!state) break;
@@ -1879,6 +1987,7 @@ inline LRESULT CALLBACK import_dialog_proc(
                     DestroyWindow(hwnd);
                     return 0;
 
+                case BTN_CLOSE:
                 case IDCANCEL:
                     DestroyWindow(hwnd);
                     return 0;
@@ -1936,6 +2045,7 @@ inline bool show_f8_import_dialog(
         );
 
     ImportDialogState state{};
+    state.title = branded_dialog_title("MECCHA Workshop - Import Mod");
     state.initial = initial;
     state.settings_root = settings_root;
 
@@ -1947,7 +2057,7 @@ inline bool show_f8_import_dialog(
         GetModuleHandleA(nullptr);
 
     const char class_name[] =
-        "GBE_MECCHA_WORKSHOP_IMPORT_V14";
+        "GBE_MECCHA_WORKSHOP_IMPORT_V15";
 
     WNDCLASSEXA wc{};
     wc.cbSize = sizeof(wc);
@@ -1985,11 +2095,12 @@ inline bool show_f8_import_dialog(
 
     HWND hwnd =
         CreateWindowExA(
-            WS_EX_DLGMODALFRAME |
             WS_EX_TOPMOST,
             class_name,
             "MECCHA Workshop - Import Mod",
-            WS_CAPTION |
+            WS_POPUP |
+            WS_BORDER |
+            WS_CLIPCHILDREN |
             WS_SYSMENU,
             x,
             y,
