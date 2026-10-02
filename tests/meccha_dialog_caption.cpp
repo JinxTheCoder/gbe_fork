@@ -8,6 +8,7 @@ const wchar_t *expected_class = nullptr;
 int close_command = IDCANCEL;
 bool found_dialog = false;
 bool passed = true;
+bool checking_file_picker = false;
 
 BOOL CALLBACK inspect_dialog(HWND hwnd, LPARAM)
 {
@@ -22,6 +23,11 @@ BOOL CALLBACK inspect_dialog(HWND hwnd, LPARAM)
         std::wcerr << L"Caption mismatch. Expected [" << expected_title
                    << L"], got [" << title << L"]\n";
         passed = false;
+    }
+
+    if (checking_file_picker) {
+        PostMessageW(hwnd, WM_CLOSE, 0, 0);
+        return FALSE;
     }
 
     const LONG_PTR window_style = GetWindowLongPtrW(hwnd, GWL_STYLE);
@@ -70,12 +76,13 @@ void CALLBACK inspect_timer(HWND, UINT, UINT_PTR, DWORD)
     EnumThreadWindows(GetCurrentThreadId(), inspect_dialog, 0);
 }
 
-UINT_PTR begin_check(const wchar_t *class_name, const wchar_t *title, int command)
+UINT_PTR begin_check(const wchar_t *class_name, const wchar_t *title, int command, bool file_picker = false)
 {
     expected_class = class_name;
     expected_title = title;
     close_command = command;
     found_dialog = false;
+    checking_file_picker = file_picker;
     return SetTimer(nullptr, 0, 50, inspect_timer);
 }
 
@@ -124,7 +131,17 @@ int main()
     }
     end_check(timer);
 
+    timer = begin_check(
+        L"#32770", L"Select Workshop Mod ZIP -J\u0268n\u03C7", IDCANCEL, true);
+    if (!timer) return 2;
+    std::filesystem::path zip_path;
+    if (MecchaWorkshopUI::choose_zip_file(zip_path)) {
+        std::cerr << "Cancelled ZIP picker was accepted\n";
+        passed = false;
+    }
+    end_check(timer);
+
     if (!passed) return 1;
-    std::cout << "PASS: four dialogs use custom Unicode title bars with close and drag support; GIF frames render without native borders\n";
+    std::cout << "PASS: four custom title bars and the ZIP picker contain the exact Unicode credit; close, drag, and borderless GIF checks passed\n";
     return 0;
 }

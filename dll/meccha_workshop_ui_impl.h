@@ -1025,37 +1025,34 @@ inline bool choose_zip_file(
     std::filesystem::path &out_path
 )
 {
-    char file_buffer[32768]{};
+    wchar_t file_buffer[32768]{};
 
-    OPENFILENAMEA ofn{};
+    OPENFILENAMEW ofn{};
     ofn.lStructSize = sizeof(ofn);
     ofn.hwndOwner = GetForegroundWindow();
     ofn.lpstrFile = file_buffer;
     ofn.nMaxFile = static_cast<DWORD>(
-        sizeof(file_buffer)
+        sizeof(file_buffer) / sizeof(file_buffer[0])
     );
 
-    static const char filter[] =
-        "ZIP Archives (*.zip)\0*.zip\0"
-        "All Files (*.*)\0*.*\0\0";
+    static const wchar_t filter[] =
+        L"ZIP Archives (*.zip)\0*.zip\0"
+        L"All Files (*.*)\0*.*\0\0";
 
     ofn.lpstrFilter = filter;
     ofn.nFilterIndex = 1;
-    ofn.lpstrTitle =
-        "Select Workshop Mod ZIP";
+    const std::wstring title = branded_dialog_title("Select Workshop Mod ZIP");
+    ofn.lpstrTitle = title.c_str();
     ofn.Flags =
         OFN_FILEMUSTEXIST |
         OFN_PATHMUSTEXIST |
         OFN_NOCHANGEDIR;
 
-    if (!GetOpenFileNameA(&ofn)) {
+    if (!GetOpenFileNameW(&ofn)) {
         return false;
     }
 
-    out_path =
-        std::filesystem::u8path(
-            file_buffer
-        );
+    out_path = std::filesystem::path(file_buffer);
 
     return true;
 }
