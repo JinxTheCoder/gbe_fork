@@ -359,7 +359,7 @@ inline LRESULT CALLBACK gif_control_proc(
             GWLP_USERDATA,
             reinterpret_cast<LONG_PTR>(create->lpCreateParams)
         );
-        return TRUE;
+        return DefWindowProcA(hwnd, msg, wparam, lparam);
     }
 
     // WM_PAINT covers the entire client area, so no separate erase is needed.
@@ -519,7 +519,7 @@ inline LRESULT CALLBACK message_dialog_proc(
                 )
             );
 
-            return TRUE;
+            return DefWindowProcA(hwnd, msg, wparam, lparam);
         }
 
         case WM_CREATE: {
@@ -1611,7 +1611,7 @@ inline LRESULT CALLBACK import_dialog_proc(
                 )
             );
 
-            return TRUE;
+            return DefWindowProcA(hwnd, msg, wparam, lparam);
         }
 
         case WM_CREATE: {
