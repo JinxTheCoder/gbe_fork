@@ -1,11 +1,9 @@
-name: MECCHA exact destination repair check
+name: MECCHA verified working DLL
 
 on:
   push:
     branches: [PEAK-random-name]
     paths:
-      - tools/windows/Install_MECCHA_Title.cmd
-      - tools/windows/install_meccha_title.ps1
       - .github/workflows/meccha-title-repair.yml
   workflow_dispatch:
 
@@ -14,12 +12,11 @@ permissions:
   actions: read
 
 jobs:
-  installer:
+  publish:
     runs-on: windows-2022
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v6
-      - name: Find the verified DLL used by this repair
+      - name: Find the verified V15 build
         id: source
         shell: pwsh
         env:
@@ -27,47 +24,42 @@ jobs:
         run: |
           $runs = gh api "repos/${{ github.repository }}/actions/runs?head_sha=7e56b3c661514bd81cadd78a6bcd79f30ae126a9&per_page=10" | ConvertFrom-Json
           $build = $runs.workflow_runs | Where-Object { $_.name -eq "MECCHA verified release DLL" -and $_.conclusion -eq "success" } | Select-Object -First 1
-          if (!$build) { throw "The verified source DLL build was not found" }
+          if (!$build) { throw "The verified V15 source build was not found" }
           "run_id=$($build.id)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
-      - uses: actions/download-artifact@v4
+
+      - name: Download the verified V15 DLL
+        uses: actions/download-artifact@v4
         with:
           name: MECCHA_Title_Fixed_7e56b3c661514bd81cadd78a6bcd79f30ae126a9
           run-id: ${{ steps.source.outputs.run_id }}
           github-token: ${{ github.token }}
           path: verified_source
-      - name: Verify replacement, original backup, repeated install, and rejection of unexpected files
+
+      - name: Verify and prepare direct DLL download
         shell: pwsh
         run: |
           $source = Get-ChildItem verified_source -Recurse -Filter steam_api64.dll | Select-Object -First 1
-          if (!$source) { throw "The source DLL was not found" }
-          $package = Join-Path $env:GITHUB_WORKSPACE "tools/windows"
-          Copy-Item $source.FullName (Join-Path $package "steam_api64.dll")
-          $expected = (Get-FileHash $source.FullName -Algorithm SHA256).Hash
-          $root = Join-Path ([IO.Path]::GetTempPath()) ("MECCHA_Title_Test_" + [Guid]::NewGuid().ToString("N"))
-          [IO.Directory]::CreateDirectory($root) | Out-Null
-          $target = Join-Path $root "steam_api64.dll"
-          [IO.File]::WriteAllText($target, "Original DLL fixture preserved by repair")
-          $original = (Get-FileHash $target -Algorithm SHA256).Hash
-          $env:MECCHA_TITLE_INSTALL_TEST_ROOT = $root
-          $env:MECCHA_TITLE_INSTALL_TEST_ORIGINAL_HASH = $original
-          $env:MECCHA_TITLE_CHECK_NO_PAUSE = "1"
-          & .\tools\windows\Install_MECCHA_Title.cmd
-          if ($LASTEXITCODE -ne 0) { throw "Replacement failed" }
-          if ((Get-FileHash $target -Algorithm SHA256).Hash -ne $expected) { throw "Installed DLL differs from the verified binary" }
-          $backups = @(Get-ChildItem $root -Filter "steam_api64.dll.BeforeTitleRepair.*.bak")
-          if ($backups.Count -ne 1 -or (Get-FileHash $backups[0].FullName -Algorithm SHA256).Hash -ne $original) { throw "Original backup differs" }
-          & .\tools\windows\Install_MECCHA_Title.cmd
-          if ($LASTEXITCODE -ne 0) { throw "Repeated installation failed" }
-          if (@(Get-ChildItem $root -Filter "*.bak").Count -ne 1) { throw "Repeated install changed the backup" }
-          [IO.File]::WriteAllText($target, "Unexpected DLL left untouched")
-          $unexpected = (Get-FileHash $target -Algorithm SHA256).Hash
-          & .\tools\windows\Install_MECCHA_Title.cmd
-          if ($LASTEXITCODE -eq 0) { throw "An unexpected target DLL was overwritten" }
-          if ((Get-FileHash $target -Algorithm SHA256).Hash -ne $unexpected) { throw "Rejected target was modified" }
-          $packageDll = Join-Path $package "steam_api64.dll"
-          [IO.File]::WriteAllText($packageDll, "Corrupted source rejected by repair")
-          & .\tools\windows\Install_MECCHA_Title.cmd
-          if ($LASTEXITCODE -eq 0) { throw "A corrupted source DLL was accepted" }
-          if ((Get-FileHash $target -Algorithm SHA256).Hash -ne $unexpected) { throw "Corrupted source modified the target" }
-          Write-Output "PASS: exact source copied, original backed up, repeated install is harmless, and unexpected target or corrupted source is rejected"
-          exit 0
+          if (!$source) { throw "steam_api64.dll was not found in the verified build" }
+
+          $expected = "0ACE29E50E287E1694CFE890191D932CE2096E783059608254BBAAA9F6FCBA4C"
+          $actual = (Get-FileHash $source.FullName -Algorithm SHA256).Hash.ToUpperInvariant()
+          if ($actual -ne $expected) {
+            throw "Verified DLL hash mismatch. Expected $expected but got $actual"
+          }
+
+          New-Item -ItemType Directory -Force -Path publish | Out-Null
+          Copy-Item $source.FullName "publish/steam_api64.dll"
+          $checksum = $actual.ToLowerInvariant() + "  steam_api64.dll"
+          Set-Content -Path "publish/steam_api64.sha256" -Value $checksum -Encoding ascii
+          Write-Output "PASS: exact working V15 DLL verified and ready for direct download"
+
+      - name: Publish exact working DLL
+        uses: actions/upload-artifact@v7
+        with:
+          name: MECCHA_Working_steam_api64_V15
+          path: |
+            publish/steam_api64.dll
+            publish/steam_api64.sha256
+          if-no-files-found: error
+          compression-level: 9
+          retention-days: 90
