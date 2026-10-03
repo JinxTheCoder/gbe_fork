@@ -69,8 +69,10 @@ new = '''SteamAPICall_t Steam_UGC::RequestUGCDetails_old( PublishedFileId_t nPub
 }
 '''
 
-if old not in text:
+if old in text:
+    path.write_text(text.replace(old, new, 1), encoding="utf-8", newline="\n")
+    print("Applied MECCHA RequestUGCDetails_old F8 import hook")
+elif "MECCHA v16: the game's Add Workshop Content button reaches this old" in text:
+    print("MECCHA RequestUGCDetails_old F8 import hook is already applied")
+else:
     raise SystemExit("Expected RequestUGCDetails_old block was not found; source changed")
-
-path.write_text(text.replace(old, new, 1), encoding="utf-8", newline="\n")
-print("Applied MECCHA RequestUGCDetails_old F8 import hook")
