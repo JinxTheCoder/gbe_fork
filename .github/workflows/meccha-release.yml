@@ -57,6 +57,19 @@ jobs:
       - name: Apply MECCHA Workshop button hook
         shell: cmd
         run: python tools\meccha_request_ugc_hook.py
+      - name: Persist patched UGC source
+        shell: pwsh
+        run: |
+          git diff --quiet -- dll/steam_ugc.cpp
+          if ($LASTEXITCODE -ne 0) {
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add dll/steam_ugc.cpp
+            git commit -m "Apply MECCHA Workshop F8 interception"
+            git push origin HEAD:PEAK-random-name
+          } else {
+            Write-Output "MECCHA Workshop hook is already persisted in steam_ugc.cpp"
+          }
       - name: Generate project files
         shell: cmd
         run: |
