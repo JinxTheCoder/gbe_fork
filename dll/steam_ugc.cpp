@@ -1563,8 +1563,46 @@ SteamAPICall_t Steam_UGC::RequestUGCDetails_old( PublishedFileId_t nPublishedFil
 {
     PRINT_DEBUG("%llu", nPublishedFileID);
 
-    // MECCHA v11: RequestUGCDetails is metadata only.
-    // Never open download consent from this API.
+#ifdef _WIN32
+    // MECCHA v16: the game's Add Workshop Content button reaches this old
+    // details API before it attempts to hand the missing item to Steam.
+    // Route that missing-item request into the same local ZIP import dialog
+    // used by F8, then refresh the live cache before returning details.
+    refresh_live_workshop_cache(settings, ugc_bridge);
+
+    if (!settings->isModInstalled(nPublishedFileID)) {
+        const std::string requested_id =
+            std::to_string(static_cast<unsigned long long>(nPublishedFileID));
+        std::string imported_id;
+
+        PRINT_DEBUG(
+            "MECCHA RequestUGCDetails_old missing item %llu; opening F8 import dialog",
+            nPublishedFileID
+        );
+
+        MecchaWorkshopUI::show_f8_import_dialog(
+            requested_id,
+            std::filesystem::u8path(Local_Storage::get_game_settings_path()),
+            imported_id
+        );
+
+        refresh_live_workshop_cache(settings, ugc_bridge);
+
+        if (!settings->isModInstalled(nPublishedFileID)) {
+            PRINT_DEBUG(
+                "MECCHA RequestUGCDetails_old item %llu still missing; blocking remote Steam fallback",
+                nPublishedFileID
+            );
+            return k_uAPICallInvalid;
+        }
+
+        PRINT_DEBUG(
+            "MECCHA RequestUGCDetails_old item %llu imported; returning local details",
+            nPublishedFileID
+        );
+    }
+#endif
+
     return internal_RequestUGCDetails(
         nPublishedFileID,
         unMaxAgeSeconds,
