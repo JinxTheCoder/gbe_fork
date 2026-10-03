@@ -7,6 +7,8 @@ on:
       - dll/meccha_workshop_ui.h
       - dll/meccha_workshop_ui_impl.h
       - dll/meccha_dialog_gif_data.h
+      - dll/steam_ugc.cpp
+      - tools/meccha_request_ugc_hook.py
       - tests/meccha_built_dll_caption.cpp
       - .github/workflows/meccha-release.yml
   workflow_dispatch:
@@ -52,6 +54,9 @@ jobs:
           repository: Detanup01/gbe_fork
           ref: third-party/build/win
           path: ${{ env.THIRD_PARTY_BASE_DIR }}/build/win
+      - name: Apply MECCHA Workshop button hook
+        shell: cmd
+        run: python tools\meccha_request_ugc_hook.py
       - name: Generate project files
         shell: cmd
         run: |
